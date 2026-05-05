@@ -16,8 +16,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 import pandas as pd
 import numpy as np
 from config import CONFIG
-from core.data_fetcher import DataFetcher
-from core.indicators import atr
 from core.signal import Direction
 from strategies.ensemble import EnsembleStrategy
 from strategies.supertrend_rsi import SuperTrendRSIStrategy
@@ -98,6 +96,9 @@ class Backtest:
         initial_capital: float = 1000.0,
         risk_per_trade: float = 0.015,
         leverage: int = 5,
+        slippage_bps: float | None = None,
+        spread_bps: float | None = None,
+        max_hold_hours: float | None = None,
     ):
         self.symbol          = symbol
         self.interval        = interval
@@ -109,6 +110,22 @@ class Backtest:
         self.sl_mult         = CONFIG.risk.atr_sl_multiplier
         self.tp1_mult        = CONFIG.risk.atr_tp1_multiplier
         self.tp2_mult        = CONFIG.risk.atr_tp2_multiplier
+        self.slippage_bps    = (
+            float(slippage_bps)
+            if slippage_bps is not None
+            else float(CONFIG.trading.backtest_slippage_bps)
+        )
+        self.spread_bps      = (
+            float(spread_bps)
+            if spread_bps is not None
+            else float(CONFIG.trading.backtest_spread_bps)
+        )
+        hold_hours = (
+            float(max_hold_hours)
+            if max_hold_hours is not None
+            else float(CONFIG.trading.backtest_max_hold_hours)
+        )
+        self.max_hold_bars = self._bars_from_hours(hold_hours)
 
     def run(self) -> dict:
         log.info(f"Fetching {self.days}d of {self.symbol} {self.interval} candles…")
@@ -123,21 +140,26 @@ class Backtest:
         balance = self.capital
         warmup = 60  # bars needed before signaling
 
-        for i in range(warmup, len(df)):
-            window = df.iloc[:i].copy()
+        for i in range(warmup + 1, len(df) - 1):
+            # Keep one extra bar in the window so strategy closed-bar indexing (-2)
+            # aligns with live behavior where newest candle can still be in-flight.
+            window = df.iloc[: i + 1].copy()
             signal = self.strategy.generate(self.symbol, window)
             if signal is None or not signal.is_valid:
                 continue
 
             # Position sizing
-            entry   = signal.entry_price
+            entry   = self._apply_entry_cost(signal.entry_price, signal.direction)
             sl      = signal.stop_loss
             risk_amount = balance * self.risk_per_trade
-            qty     = (risk_amount * self.leverage) / abs(entry - sl)
+            risk_per_unit = abs(entry - sl)
+            if risk_per_unit <= 0:
+                continue
+            qty     = (risk_amount * self.leverage) / risk_per_unit
             notional = qty * entry
 
             # Simulate exit using future candles
-            outcome = self._simulate_exit(df, i, signal, qty)
+            outcome = self._simulate_exit(df, i, signal, qty, entry)
             if outcome is None:
                 continue
 
@@ -150,8 +172,11 @@ class Backtest:
                 "direction":   signal.direction.value,
                 "confidence":  signal.confidence,
                 "entry":       entry,
+                "entry_signal": signal.entry_price,
                 "exit":        exit_price,
                 "pnl":         pnl,
+                "slippage_bps": self.slippage_bps,
+                "spread_bps": self.spread_bps,
                 "balance":     balance,
                 "reason":      reason,
                 "rr":          signal.risk_reward,
@@ -163,52 +188,61 @@ class Backtest:
 
         return self._report(trades, balance)
 
-    def _simulate_exit(self, df, entry_bar, signal, qty):
+    def _simulate_exit(self, df, entry_bar, signal, qty, entry_price):
         """Walk forward to find first SL/TP hit."""
         direction = signal.direction
-        entry     = signal.entry_price
+        entry     = entry_price
         sl        = signal.stop_loss
         tp1       = signal.take_profit_1
         tp2       = signal.take_profit_2
         tp1_hit   = False
         partial_pnl = 0.0
 
-        for j in range(entry_bar + 1, min(entry_bar + 200, len(df))):
+        max_exit_bar = min(entry_bar + self.max_hold_bars, len(df) - 1)
+        for j in range(entry_bar + 1, max_exit_bar + 1):
             bar = df.iloc[j]
             h, l = bar["high"], bar["low"]
             bars = j - entry_bar
 
             if direction == Direction.LONG:
                 if not tp1_hit and h >= tp1:
-                    partial_pnl = (tp1 - entry) * qty * 0.5
+                    tp1_fill = self._apply_exit_cost(tp1, direction, is_stop=False)
+                    partial_pnl = (tp1_fill - entry) * qty * 0.5
                     qty *= 0.5
                     tp1_hit = True
                 if h >= tp2:
-                    total = partial_pnl + (tp2 - entry) * qty
-                    return total, tp2, bars, "TP2"
+                    tp2_fill = self._apply_exit_cost(tp2, direction, is_stop=False)
+                    total = partial_pnl + (tp2_fill - entry) * qty
+                    return total, tp2_fill, bars, "TP2"
                 if l <= sl:
-                    total = partial_pnl + (sl - entry) * qty
-                    return total, sl, bars, "SL"
+                    sl_fill = self._apply_exit_cost(sl, direction, is_stop=True)
+                    total = partial_pnl + (sl_fill - entry) * qty
+                    return total, sl_fill, bars, "SL"
             else:
                 if not tp1_hit and l <= tp1:
-                    partial_pnl = (entry - tp1) * qty * 0.5
+                    tp1_fill = self._apply_exit_cost(tp1, direction, is_stop=False)
+                    partial_pnl = (entry - tp1_fill) * qty * 0.5
                     qty *= 0.5
                     tp1_hit = True
                 if l <= tp2:
-                    total = partial_pnl + (entry - tp2) * qty
-                    return total, tp2, bars, "TP2"
+                    tp2_fill = self._apply_exit_cost(tp2, direction, is_stop=False)
+                    total = partial_pnl + (entry - tp2_fill) * qty
+                    return total, tp2_fill, bars, "TP2"
                 if h >= sl:
-                    total = partial_pnl + (entry - sl) * qty
-                    return total, sl, bars, "SL"
+                    sl_fill = self._apply_exit_cost(sl, direction, is_stop=True)
+                    total = partial_pnl + (entry - sl_fill) * qty
+                    return total, sl_fill, bars, "SL"
 
         # Timeout — exit at last close
-        last = df.iloc[min(entry_bar + 200, len(df) - 1)]
+        last = df.iloc[max_exit_bar]
         close = last["close"]
+        exit_fill = self._apply_exit_cost(close, direction, is_stop=False)
+        bars_held = max_exit_bar - entry_bar
         if direction == Direction.LONG:
-            total = partial_pnl + (close - entry) * qty
+            total = partial_pnl + (exit_fill - entry) * qty
         else:
-            total = partial_pnl + (entry - close) * qty
-        return total, close, 200, "TIMEOUT"
+            total = partial_pnl + (entry - exit_fill) * qty
+        return total, exit_fill, bars_held, "TIMEOUT"
 
     def _report(self, trades: list, final_balance: float) -> dict:
         if not trades:
@@ -227,6 +261,9 @@ class Backtest:
             "interval":      self.interval,
             "strategy":      self.strategy.name,
             "days":          self.days,
+            "slippage_bps":  self.slippage_bps,
+            "spread_bps":    self.spread_bps,
+            "max_hold_bars": self.max_hold_bars,
             "total_trades":  len(tdf),
             "win_rate":      round(wr, 1),
             "profit_factor": round(pf, 2),
@@ -268,6 +305,27 @@ class Backtest:
                 max_dd = dd
         return max_dd
 
+    def _bars_from_hours(self, hours: float) -> int:
+        if hours <= 0:
+            return 200
+        minutes = INTERVAL_MINUTES.get(self.interval, 15)
+        return max(1, int((hours * 60) / minutes))
+
+    def _apply_entry_cost(self, price: float, direction: Direction) -> float:
+        half_spread = self.spread_bps / 20000.0
+        slip = self.slippage_bps / 10000.0
+        if direction == Direction.LONG:
+            return price * (1 + half_spread + slip)
+        return price * (1 - half_spread - slip)
+
+    def _apply_exit_cost(self, price: float, direction: Direction, is_stop: bool) -> float:
+        half_spread = self.spread_bps / 20000.0
+        slip = self.slippage_bps / 10000.0
+        impact = slip * (1.5 if is_stop else 1.0)
+        if direction == Direction.LONG:
+            return price * (1 - half_spread - impact)
+        return price * (1 + half_spread + impact)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AlphaBot Backtester")
@@ -277,6 +335,24 @@ if __name__ == "__main__":
     parser.add_argument("--strategy", default="ensemble",
                         choices=list(STRATEGY_MAP.keys()))
     parser.add_argument("--capital",  type=float, default=1000.0)
+    parser.add_argument(
+        "--slippage-bps",
+        type=float,
+        default=CONFIG.trading.backtest_slippage_bps,
+        help="One-way slippage in basis points applied to entry/exit fills",
+    )
+    parser.add_argument(
+        "--spread-bps",
+        type=float,
+        default=CONFIG.trading.backtest_spread_bps,
+        help="Bid/ask spread in basis points",
+    )
+    parser.add_argument(
+        "--max-hold-hours",
+        type=float,
+        default=CONFIG.trading.backtest_max_hold_hours,
+        help="Force timeout exit after this many hours",
+    )
     args = parser.parse_args()
 
     bt = Backtest(
@@ -285,5 +361,8 @@ if __name__ == "__main__":
         days=args.days,
         strategy_name=args.strategy,
         initial_capital=args.capital,
+        slippage_bps=args.slippage_bps,
+        spread_bps=args.spread_bps,
+        max_hold_hours=args.max_hold_hours,
     )
     bt.run()

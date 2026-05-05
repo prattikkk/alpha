@@ -27,6 +27,7 @@ from core.executor import TestnetExecutor
 from core.portfolio import Portfolio
 from core.position_monitor import PositionMonitor
 from core.risk_manager import RiskManager
+from core.signal import Direction
 from strategies.breakout_momentum import BreakoutMomentumStrategy
 from strategies.ema_adx_volume import EMAAdxVolumeStrategy
 from strategies.ensemble import EnsembleStrategy
@@ -238,13 +239,49 @@ class TradingBot:
         primary_tf = CONFIG.strategy.primary_tf
         htf_1 = CONFIG.strategy.htf_1
         htf_2 = CONFIG.strategy.htf_2
+        min_volume_24h = CONFIG.trading.min_volume_24h
+
+        cycle_stats = self.portfolio.stats()
+        daily_loss_limit_pct = CONFIG.risk.max_daily_loss_pct * 100
+        halt_new_entries = cycle_stats.get("return_pct", 0.0) <= -daily_loss_limit_pct
+        if halt_new_entries:
+            log.critical(
+                "Daily loss guard active | return=%.2f%% <= -%.2f%% | pausing new entries",
+                cycle_stats.get("return_pct", 0.0),
+                daily_loss_limit_pct,
+            )
+
+        eligible_symbols: list[str] = []
 
         for symbol in self.symbols:
+            if halt_new_entries:
+                break
+
             if symbol in self.portfolio.open_positions:
                 log.debug("[%s] position already open, skipping new entry", symbol)
                 continue
 
-            multi_tf = self.fetcher.get_multi_tf(symbol)
+            if min_volume_24h > 0:
+                quote_volume = self.fetcher.get_24h_quote_volume(symbol)
+                if quote_volume is None:
+                    log.warning("[%s] 24h quote volume unavailable, skipping", symbol)
+                    continue
+                if quote_volume < min_volume_24h:
+                    log.info(
+                        "[%s] skipped: 24h volume %.0f < min %.0f",
+                        symbol,
+                        quote_volume,
+                        min_volume_24h,
+                    )
+                    continue
+
+            eligible_symbols.append(symbol)
+
+        multi_tf_by_symbol = self.fetcher.get_multi_tf_bulk(eligible_symbols) if eligible_symbols else {}
+
+        for symbol in eligible_symbols:
+            multi_tf = multi_tf_by_symbol.get(symbol, {})
+
             df = multi_tf.get(primary_tf)
             if df is None or len(df) < 120:
                 log.warning("[%s] not enough %s data to evaluate", symbol, primary_tf)
@@ -269,6 +306,27 @@ class TradingBot:
                     signal.reason,
                 )
                 continue
+
+            funding_threshold = CONFIG.trading.max_unfavorable_funding_rate
+            if funding_threshold > 0:
+                funding_rate = self.fetcher.get_funding_rate(symbol)
+                if funding_rate is not None:
+                    if signal.direction == Direction.LONG and funding_rate > funding_threshold:
+                        log.info(
+                            "[%s] skipped: funding %.5f too high for LONG (threshold %.5f)",
+                            symbol,
+                            funding_rate,
+                            funding_threshold,
+                        )
+                        continue
+                    if signal.direction == Direction.SHORT and funding_rate < -funding_threshold:
+                        log.info(
+                            "[%s] skipped: funding %.5f too low for SHORT (threshold %.5f)",
+                            symbol,
+                            funding_rate,
+                            funding_threshold,
+                        )
+                        continue
 
             log.info(
                 "[%s] valid signal %s | conf=%.2f | rr=%.2f",
@@ -337,7 +395,7 @@ def main() -> None:
     parser.add_argument(
         "--analysis-interval",
         type=int,
-        default=int(os.getenv("ANALYSIS_INTERVAL", "300")),
+        default=int(os.getenv("ANALYSIS_INTERVAL", str(CONFIG.trading.analysis_interval))),
         help="Seconds between cycles when running continuously",
     )
     parser.add_argument(
