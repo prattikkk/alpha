@@ -1,0 +1,12 @@
+python-binance==1.0.19
+pandas==2.1.4
+numpy==1.26.4
+ta==0.11.0
+python-dotenv==1.0.0
+aiohttp==3.9.3
+asyncio==3.4.3
+colorlog==6.8.2
+rich==13.7.1
+schedule==1.2.1
+requests==2.31.0
+scipy==1.12.0

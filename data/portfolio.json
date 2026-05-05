@@ -1,0 +1,34 @@
+{
+  "balance": 1014.5554000000011,
+  "total_capital": 1000.0,
+  "open_positions": {},
+  "closed_trades": [
+    {
+      "id": "ADAUSDT_1777965622",
+      "symbol": "ADAUSDT",
+      "direction": "LONG",
+      "entry_price": 0.2561,
+      "stop_loss": 0.2545541914053461,
+      "take_profit_1": 0.25867634765775654,
+      "take_profit_2": 0.26022215625241046,
+      "quantity": 48518.0,
+      "notional": 12425.4598,
+      "risk_usdt": 14.999908279083769,
+      "strategy": "ema_adx_volume",
+      "confidence": 0.8,
+      "open_time": "2026-05-05T07:20:22.399130",
+      "close_time": "2026-05-05T07:22:22.238897",
+      "exit_price": 0.2564,
+      "pnl": 14.55540000000109,
+      "status": "MANUAL_FLAT",
+      "tp1_hit": false,
+      "leverage": 5,
+      "order_ids": {
+        "entry": 625218730,
+        "sl": null,
+        "tp1": null,
+        "tp2": null
+      }
+    }
+  ]
+}

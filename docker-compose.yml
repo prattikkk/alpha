@@ -1,0 +1,12 @@
+version: "3.9"
+services:
+  alphabot:
+    build: .
+    container_name: alphabot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+    environment:
+      - PYTHONUNBUFFERED=1
