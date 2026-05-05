@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 from typing import Optional
 from core.signal import Signal, Direction
-from core.indicators import ema, adx, atr, volume_profile, rsi
+from core.indicators import adx, atr, ema, pivot_points, rsi, volume_profile
 from config import CONFIG
 from utils.logger import get_logger
 
@@ -79,6 +79,7 @@ class EMAAdxVolumeStrategy:
         vol  = vol_ratio.iloc[signal_idx]
         curr_atr = _atr.iloc[signal_idx]
         curr_rsi = rsi_vals.iloc[signal_idx]
+        pivots = pivot_points(df.iloc[:-1]) if bool(cfg.use_support_resistance) else None
 
         if np.isnan(curr_atr) or curr_atr == 0:
             return None
@@ -120,6 +121,11 @@ class EMAAdxVolumeStrategy:
             htf_b = self._htf_score(htf_df, htf_df2)
             if htf_b > 0:
                 confidence += 0.10
+            if pivots:
+                if curr >= pivots["PP"]:
+                    confidence += 0.05
+                if curr >= pivots["R1"]:
+                    confidence += 0.03
 
         elif trending and ema_bear and di_bear:
             direction = Direction.SHORT
@@ -134,6 +140,11 @@ class EMAAdxVolumeStrategy:
             htf_b = self._htf_score(htf_df, htf_df2)
             if htf_b < 0:
                 confidence += 0.10
+            if pivots:
+                if curr <= pivots["PP"]:
+                    confidence += 0.05
+                if curr <= pivots["S1"]:
+                    confidence += 0.03
 
         if direction == Direction.FLAT:
             return None
@@ -156,7 +167,8 @@ class EMAAdxVolumeStrategy:
 
         reason = (
             f"EMA {'↑' if ema_bull else '↓'} | ADX={adx_val:.1f} | "
-            f"DI+={dip:.1f} DI-={din:.1f} | Vol={vol:.1f}x | RSI={curr_rsi:.1f} | closed_bar=true"
+            f"DI+={dip:.1f} DI-={din:.1f} | Vol={vol:.1f}x | RSI={curr_rsi:.1f} | "
+            f"SR={'on' if pivots else 'off'} | closed_bar=true"
         )
 
         return Signal(

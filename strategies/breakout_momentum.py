@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 from typing import Optional
 from core.signal import Signal, Direction
-from core.indicators import bollinger_bands, atr, rsi, ema, volume_profile
+from core.indicators import bollinger_bands, atr, rsi, ema, pivot_points, volume_profile
 from config import CONFIG
 from utils.logger import get_logger
 
@@ -88,6 +88,7 @@ class BreakoutMomentumStrategy:
         curr_vol      = vol_ratio.iloc[signal_idx]
         curr_rsi      = rsi_vals.iloc[signal_idx]
         curr_atr      = _atr.iloc[signal_idx]
+        pivots = pivot_points(df.iloc[:-1]) if bool(cfg.use_support_resistance) else None
 
         if np.isnan(curr_atr) or curr_atr == 0:
             return None
@@ -121,6 +122,11 @@ class BreakoutMomentumStrategy:
             if atr_expanding: confidence += 0.15
             if self._htf_aligned(htf_df, htf_df2, bullish=True):
                 confidence += 0.10
+            if pivots:
+                if curr_price >= pivots["R1"]:
+                    confidence += 0.08
+                elif curr_price <= pivots["PP"]:
+                    confidence -= 0.05
 
         elif bear_bb and bear_don:
             direction = Direction.SHORT
@@ -130,11 +136,16 @@ class BreakoutMomentumStrategy:
             if atr_expanding: confidence += 0.15
             if self._htf_aligned(htf_df, htf_df2, bullish=False):
                 confidence += 0.10
+            if pivots:
+                if curr_price <= pivots["S1"]:
+                    confidence += 0.08
+                elif curr_price >= pivots["PP"]:
+                    confidence -= 0.05
 
         if direction == Direction.FLAT:
             return None
 
-        confidence = min(confidence, 1.0)
+        confidence = max(0.0, min(confidence, 1.0))
 
         # Wider SL for breakouts (volatility event)
         sl_mult  = risk.atr_sl_multiplier * 1.2
@@ -154,7 +165,8 @@ class BreakoutMomentumStrategy:
             f"BB breakout {'↑' if direction==Direction.LONG else '↓'} | "
             f"Donchian={'yes' if (bull_don or bear_don) else 'no'} | "
             f"Vol={curr_vol:.1f}x | RSI={curr_rsi:.1f} | "
-            f"ATR_exp={'yes' if atr_expanding else 'no'} | closed_bar=true"
+            f"ATR_exp={'yes' if atr_expanding else 'no'} | "
+            f"SR={'on' if pivots else 'off'} | closed_bar=true"
         )
 
         return Signal(

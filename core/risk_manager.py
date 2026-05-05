@@ -6,6 +6,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from typing import Optional
+
 from core.signal import Signal, Direction
 from config import CONFIG
 from utils.logger import get_logger
@@ -66,6 +67,8 @@ class RiskManager:
             return None
 
         risk_amount = capital * risk_cfg.max_risk_per_trade
+        sizing_mult = self._adaptive_sizing_multiplier(signal)
+        risk_amount *= sizing_mult
 
         # Raw quantity
         qty = (risk_amount * risk_cfg.leverage) / risk_per_unit
@@ -102,7 +105,7 @@ class RiskManager:
         actual_risk = qty * risk_per_unit / risk_cfg.leverage
         log.info(
             f"[{signal.symbol}] {signal.direction.value} | "
-            f"qty={qty} | notional=${notional:.2f} | risk=${actual_risk:.2f}"
+            f"qty={qty} | notional=${notional:.2f} | risk=${actual_risk:.2f} | size_mult={sizing_mult:.2f}"
         )
 
         return PositionSize(
@@ -127,6 +130,62 @@ class RiskManager:
         cap = self.portfolio.total_capital
         max_risk = cap * risk_cfg.max_portfolio_risk
         return total_risk < max_risk
+
+    def _adaptive_sizing_multiplier(self, signal: Signal) -> float:
+        if not bool(getattr(risk_cfg, "adaptive_sizing_enabled", True)):
+            return 1.0
+
+        min_mult = max(0.1, float(getattr(risk_cfg, "adaptive_min_multiplier", 0.5)))
+        max_mult = max(min_mult, float(getattr(risk_cfg, "adaptive_max_multiplier", 1.5)))
+
+        confidence_mult = 0.75 + 0.5 * float(signal.confidence)
+        perf_mult = self._performance_multiplier()
+        vol_mult = self._volatility_multiplier(signal)
+
+        combined = confidence_mult * perf_mult * vol_mult
+        return max(min_mult, min(max_mult, combined))
+
+    def _performance_multiplier(self) -> float:
+        recent_window = max(5, int(getattr(risk_cfg, "adaptive_recent_trades", 20)))
+        trades = list(self.portfolio.closed_trades)[-recent_window:]
+        if len(trades) < 5:
+            return 1.0
+
+        pnls = [float(t.get("pnl", 0.0)) for t in trades]
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p <= 0]
+        if not wins or not losses:
+            return 1.0
+
+        win_rate = len(wins) / len(pnls)
+        avg_win = sum(wins) / len(wins)
+        avg_loss = abs(sum(losses) / len(losses)) if losses else 0.0
+        if avg_loss <= 0:
+            return 1.0
+
+        b = avg_win / avg_loss
+        if b <= 0:
+            return 1.0
+
+        kelly = win_rate - (1.0 - win_rate) / b
+        # Normalize expected useful range and map to multiplier band.
+        normalized = max(-1.0, min(1.0, kelly / 0.25))
+        return 1.0 + 0.35 * normalized
+
+    @staticmethod
+    def _volatility_multiplier(signal: Signal) -> float:
+        try:
+            atr_pct = abs(float(signal.atr) / float(signal.entry_price))
+        except Exception:
+            return 1.0
+
+        if atr_pct >= 0.02:
+            return 0.75
+        if atr_pct >= 0.01:
+            return 0.9
+        if atr_pct <= 0.005:
+            return 1.05
+        return 1.0
 
     @staticmethod
     def _round_step(qty: float, step: float) -> float:

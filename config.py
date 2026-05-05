@@ -39,6 +39,10 @@ class _Config:
     """Primary runtime configuration used across bot modules."""
 
     def __init__(self):
+        self.exchange = _Section(
+            name=os.getenv("EXCHANGE", "binance").strip().lower(),
+        )
+
         api_key = os.getenv("BINANCE_API_KEY", "")
         api_secret = os.getenv("BINANCE_API_SECRET", "")
 
@@ -71,6 +75,10 @@ class _Config:
             glm_model=os.getenv("GLM_MODEL", "glm-5.1"),
             glm_temperature=float(os.getenv("GLM_TEMPERATURE", "0.3")),
             glm_max_tokens=int(os.getenv("GLM_MAX_TOKENS", "2048")),
+            sentiment_enabled=_env_bool("AI_SENTIMENT_ENABLED", False),
+            sentiment_timeout_seconds=int(os.getenv("AI_SENTIMENT_TIMEOUT_SECONDS", "8")),
+            sentiment_cache_seconds=int(os.getenv("AI_SENTIMENT_CACHE_SECONDS", "300")),
+            sentiment_max_adjustment=float(os.getenv("AI_SENTIMENT_MAX_ADJUSTMENT", "0.10")),
         )
 
         self.api = _Section(
@@ -89,6 +97,7 @@ class _Config:
             htf_1=os.getenv("HTF_1", "1h"),
             htf_2=os.getenv("HTF_2", "4h"),
             min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.70")),
+            use_support_resistance=_env_bool("USE_SUPPORT_RESISTANCE", True),
             ensemble_min_signals=int(os.getenv("ENSEMBLE_MIN_SIGNALS", "2")),
             regime_adx_trending=float(os.getenv("REGIME_ADX_TRENDING", "23")),
             regime_vol_window=int(os.getenv("REGIME_VOL_WINDOW", "80")),
@@ -111,6 +120,14 @@ class _Config:
         self.risk = _Section(
             initial_capital=float(os.getenv("INITIAL_CAPITAL_USDT", "1000")),
             max_risk_per_trade=float(os.getenv("MAX_RISK_PER_TRADE", "0.015")),
+            adaptive_sizing_enabled=_env_bool("ADAPTIVE_SIZING_ENABLED", True),
+            adaptive_recent_trades=int(os.getenv("ADAPTIVE_RECENT_TRADES", "20")),
+            adaptive_min_multiplier=float(os.getenv("ADAPTIVE_MIN_MULTIPLIER", "0.5")),
+            adaptive_max_multiplier=float(os.getenv("ADAPTIVE_MAX_MULTIPLIER", "1.5")),
+            correlation_management_enabled=_env_bool("CORRELATION_MANAGEMENT_ENABLED", True),
+            correlation_threshold=float(os.getenv("CORRELATION_THRESHOLD", "0.80")),
+            correlation_lookback=int(os.getenv("CORRELATION_LOOKBACK", "120")),
+            max_correlated_positions=int(os.getenv("MAX_CORRELATED_POSITIONS", "1")),
             max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "4")),
             max_portfolio_risk=float(os.getenv("MAX_PORTFOLIO_RISK", "0.06")),
             max_daily_loss_pct=float(os.getenv("MAX_DAILY_LOSS_PCT", "0.05")),
@@ -139,6 +156,7 @@ class _Config:
             backtest_spread_bps=float(os.getenv("BACKTEST_SPREAD_BPS", "2")),
             backtest_max_hold_hours=float(os.getenv("BACKTEST_MAX_HOLD_HOURS", os.getenv("MAX_HOLD_HOURS", "8"))),
             max_positions=int(os.getenv("MAX_POSITIONS", "5")),
+            close_on_shutdown=_env_bool("CLOSE_ON_SHUTDOWN", False),
             blacklist=_csv_env("BLACKLIST", default_blacklist),
             whitelist=whitelist if whitelist else None,
             dry_run=_env_bool("DRY_RUN", True),
@@ -164,6 +182,12 @@ class _Config:
         self.logging = _Section(
             level=os.getenv("LOG_LEVEL", "INFO"),
             file=os.getenv("LOG_FILE", "trading_bot.log"),
+            format=os.getenv("LOG_FORMAT", "text").strip().lower(),
+        )
+
+        self.dashboard = _Section(
+            host=os.getenv("DASHBOARD_HOST", "127.0.0.1"),
+            port=int(os.getenv("DASHBOARD_PORT", "8080")),
         )
 
     @staticmethod

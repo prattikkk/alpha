@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 from typing import Optional
 from core.signal import Signal, Direction
-from core.indicators import supertrend, rsi, atr, ema
+from core.indicators import atr, ema, pivot_points, rsi, supertrend
 from config import CONFIG
 from utils.logger import get_logger
 
@@ -70,6 +70,7 @@ class SuperTrendRSIStrategy:
         prev_rsi = rsi_vals.iloc[prev_idx]
         curr_price = df["close"].iloc[signal_idx]
         curr_atr = _atr.iloc[signal_idx]
+        pivots = pivot_points(df.iloc[:-1]) if bool(cfg.use_support_resistance) else None
 
         if curr_atr == 0 or np.isnan(curr_atr):
             return None
@@ -109,6 +110,11 @@ class SuperTrendRSIStrategy:
             # Taker buy ratio
             if "taker_ratio" in df.columns and df["taker_ratio"].iloc[signal_idx] > 0.55:
                 confidence += 0.10
+            if pivots:
+                if curr_price >= pivots["PP"]:
+                    confidence += 0.05
+                if curr_price >= pivots["R1"]:
+                    confidence += 0.03
             confidence = min(confidence, 1.0)
 
         # ----- SHORT -----
@@ -129,6 +135,11 @@ class SuperTrendRSIStrategy:
                 confidence += 0.10
             if "taker_ratio" in df.columns and df["taker_ratio"].iloc[signal_idx] < 0.45:
                 confidence += 0.10
+            if pivots:
+                if curr_price <= pivots["PP"]:
+                    confidence += 0.05
+                if curr_price <= pivots["S1"]:
+                    confidence += 0.03
             confidence = min(confidence, 1.0)
 
         else:
@@ -150,7 +161,8 @@ class SuperTrendRSIStrategy:
 
         reason = (
             f"ST={'↑' if curr_dir==1 else '↓'} flip={'yes' if curr_dir!=prev_dir else 'no'} | "
-            f"RSI={curr_rsi:.1f} | HTF={htf_bias.value} | closed_bar=true"
+            f"RSI={curr_rsi:.1f} | HTF={htf_bias.value} | "
+            f"SR={'on' if pivots else 'off'} | closed_bar=true"
         )
 
         return Signal(

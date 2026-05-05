@@ -17,13 +17,14 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal as os_signal
 import time
 from datetime import datetime
 from typing import Iterable
 
 from config import CONFIG
-from core.data_fetcher import DataFetcher
-from core.executor import TestnetExecutor
+from core.ai_sentiment import AISentimentEngine
+from core.exchange_factory import create_data_fetcher, create_executor
 from core.portfolio import Portfolio
 from core.position_monitor import PositionMonitor
 from core.risk_manager import RiskManager
@@ -33,7 +34,7 @@ from strategies.ema_adx_volume import EMAAdxVolumeStrategy
 from strategies.ensemble import EnsembleStrategy
 from strategies.supertrend_rsi import SuperTrendRSIStrategy
 from utils.logger import get_logger
-from utils.notifier import notify_signal, notify_stats, notify_trade_open
+from utils.notifier import notify_event, notify_signal, notify_stats, notify_trade_open
 
 log = get_logger("Main")
 
@@ -75,17 +76,20 @@ class TradingBot:
         self.strategy_name = strategy_name
         self.strategy = STRATEGY_MAP[strategy_name]()
         self.dry_run = dry_run
+        self.exchange = CONFIG.exchange.name
 
-        self.fetcher = DataFetcher()
-        self.executor = TestnetExecutor()
+        self.fetcher = create_data_fetcher(self.exchange)
+        self.executor = create_executor(self.exchange)
         self.portfolio = Portfolio()
         self.risk = RiskManager(self.portfolio)
         self.monitor = PositionMonitor(self.portfolio, self.executor, self.fetcher)
+        self.ai_sentiment = AISentimentEngine()
 
         self._sync_positions_from_exchange()
 
         log.info(
-            "Bot initialized | strategy=%s | dry_run=%s | symbols=%s",
+            "Bot initialized | exchange=%s | strategy=%s | dry_run=%s | symbols=%s",
+            self.exchange,
             self.strategy_name,
             self.dry_run,
             ",".join(self.symbols),
@@ -328,6 +332,20 @@ class TradingBot:
                         )
                         continue
 
+            if self._is_correlation_blocked(symbol, primary_tf):
+                continue
+
+            if self.ai_sentiment.enabled:
+                context = self._ai_context(df)
+                regime = str(signal.extra.get("regime", "UNKNOWN"))
+                ai_adj = self.ai_sentiment.confidence_adjustment(symbol, signal, regime, context)
+                if ai_adj != 0:
+                    signal.confidence = max(0.0, min(1.0, signal.confidence + ai_adj))
+                    signal.reason = f"{signal.reason} | ai_adj={ai_adj:+.2f}"
+                    if not signal.is_valid:
+                        log.info("[%s] AI sentiment reduced confidence below threshold", symbol)
+                        continue
+
             log.info(
                 "[%s] valid signal %s | conf=%.2f | rr=%.2f",
                 symbol,
@@ -377,6 +395,86 @@ class TradingBot:
             stats.get("trades", 0),
         )
         notify_stats(stats)
+
+    def _is_correlation_blocked(self, candidate_symbol: str, interval: str) -> bool:
+        if not bool(CONFIG.risk.correlation_management_enabled):
+            return False
+
+        open_symbols = [s for s in self.portfolio.open_positions.keys() if s != candidate_symbol]
+        if not open_symbols:
+            return False
+
+        threshold = float(CONFIG.risk.correlation_threshold)
+        lookback = int(CONFIG.risk.correlation_lookback)
+        max_correlated = max(1, int(CONFIG.risk.max_correlated_positions))
+
+        correlated = 0
+        for open_symbol in open_symbols:
+            corr = self.fetcher.get_close_correlation(candidate_symbol, open_symbol, interval, lookback)
+            if corr is None:
+                continue
+            if abs(corr) >= threshold:
+                correlated += 1
+                log.info(
+                    "[%s] high correlation with %s: %.2f",
+                    candidate_symbol,
+                    open_symbol,
+                    corr,
+                )
+
+        if correlated >= max_correlated:
+            log.warning(
+                "[%s] skipped due correlation cap | correlated=%s threshold=%.2f",
+                candidate_symbol,
+                correlated,
+                threshold,
+            )
+            return True
+        return False
+
+    @staticmethod
+    def _ai_context(df) -> dict:
+        signal_idx = -2
+        context = {
+            "close": float(df["close"].iloc[signal_idx]),
+            "volume": float(df["volume"].iloc[signal_idx]),
+        }
+        if "taker_ratio" in df.columns:
+            context["taker_ratio"] = float(df["taker_ratio"].iloc[signal_idx])
+        if "body" in df.columns:
+            context["body"] = float(df["body"].iloc[signal_idx])
+        return context
+
+    def shutdown(self, close_positions: bool, reason: str = "shutdown") -> None:
+        positions = dict(self.portfolio.open_positions)
+        if not positions:
+            notify_event("AlphaBot Shutdown", f"No open positions. Reason: {reason}")
+            return
+
+        closed_count = 0
+        for symbol, pos in positions.items():
+            if close_positions and not self.dry_run:
+                order_ids = pos.get("order_ids", {})
+                for key in ["sl", "tp1", "tp2"]:
+                    oid = order_ids.get(key)
+                    if oid and oid != "DRY_RUN":
+                        self.executor.cancel_order(symbol, oid)
+
+                qty = float(pos.get("quantity", 0.0))
+                if qty > 0:
+                    self.executor.close_position_market(symbol, pos.get("direction", "LONG"), qty)
+                exit_price = self.fetcher.get_current_price(symbol) or float(pos.get("entry_price", 0.0))
+                self.portfolio.close_position(symbol, float(exit_price), reason="SHUTDOWN_EXIT")
+                closed_count += 1
+
+        self.portfolio._save()
+        notify_event(
+            "AlphaBot Shutdown",
+            (
+                f"Reason: {reason}. Open positions: {len(positions)}. "
+                f"Closed on shutdown: {closed_count}."
+            ),
+        )
 
 
 def main() -> None:
@@ -432,11 +530,36 @@ def main() -> None:
 
     cycle_target = 1 if args.once else args.cycles
 
+    shutdown_state = {"requested": False, "reason": "manual"}
+
+    def _request_shutdown(reason: str) -> None:
+        if shutdown_state["requested"]:
+            return
+        shutdown_state["requested"] = True
+        shutdown_state["reason"] = reason
+        log.warning("Shutdown requested: %s", reason)
+        notify_event("AlphaBot", f"Shutdown requested: {reason}")
+
+    def _handle_signal(signum, _frame) -> None:
+        try:
+            name = os_signal.Signals(signum).name
+        except Exception:
+            name = str(signum)
+        _request_shutdown(f"signal:{name}")
+
+    if hasattr(os_signal, "SIGTERM"):
+        os_signal.signal(os_signal.SIGTERM, _handle_signal)
+    if hasattr(os_signal, "SIGINT"):
+        os_signal.signal(os_signal.SIGINT, _handle_signal)
+
     bot = TradingBot(symbols=symbols, strategy_name=args.strategy, dry_run=dry_run)
 
     cycle = 0
     try:
         while True:
+            if shutdown_state["requested"]:
+                break
+
             cycle += 1
             log.info("Starting cycle %s", cycle)
             bot.run_cycle()
@@ -444,11 +567,16 @@ def main() -> None:
             if cycle_target > 0 and cycle >= cycle_target:
                 break
 
+            if shutdown_state["requested"]:
+                break
+
             sleep_for = max(5, args.analysis_interval)
             log.info("Sleeping %ss before next cycle", sleep_for)
             time.sleep(sleep_for)
     except KeyboardInterrupt:
-        log.info("Interrupted by user, shutting down")
+        _request_shutdown("keyboard_interrupt")
+
+    bot.shutdown(close_positions=bool(CONFIG.trading.close_on_shutdown), reason=shutdown_state["reason"])
 
     final_stats = bot.portfolio.stats()
     log.info("Final stats: %s", final_stats)

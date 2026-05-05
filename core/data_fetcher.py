@@ -229,6 +229,31 @@ class DataFetcher:
             log.debug("Funding rate parse error [%s]: %s", symbol, e)
             return None
 
+    def get_close_correlation(
+        self,
+        symbol_a: str,
+        symbol_b: str,
+        interval: str,
+        lookback: int,
+    ) -> Optional[float]:
+        """Return correlation of close-to-close returns between two symbols."""
+        look = max(50, int(lookback))
+        df_a = self.get_ohlcv(symbol_a, interval=interval, limit=look + 5)
+        df_b = self.get_ohlcv(symbol_b, interval=interval, limit=look + 5)
+        if df_a is None or df_b is None or df_a.empty or df_b.empty:
+            return None
+
+        try:
+            series_a = df_a["close"].pct_change().dropna().tail(look)
+            series_b = df_b["close"].pct_change().dropna().tail(look)
+            merged = pd.concat([series_a, series_b], axis=1, join="inner").dropna()
+            if len(merged) < 30:
+                return None
+            return float(merged.iloc[:, 0].corr(merged.iloc[:, 1]))
+        except Exception as e:
+            log.debug("Correlation calc failed [%s/%s]: %s", symbol_a, symbol_b, e)
+            return None
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

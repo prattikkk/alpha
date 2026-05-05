@@ -106,3 +106,7 @@ def notify_stats(stats: dict):
         f"PnL: ${stats.get('total_pnl', 0):+.2f} | PF: {stats.get('profit_factor', 0):.2f}\n"
         f"Balance: ${stats.get('balance', 0):.2f} ({stats.get('return_pct', 0):+.1f}%)"
     )
+
+
+def notify_event(title: str, message: str):
+    _send(f"ℹ️ <b>{title}</b>\n{message}")

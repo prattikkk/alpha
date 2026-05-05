@@ -65,7 +65,7 @@ Binance MAINNET (market data, read-only)
 ---
 
 ## Risk Management
-- **Position sizing**: Fixed fractional (1.5% risk per trade)
+- **Position sizing**: Adaptive sizing (confidence + recent performance + volatility)
 - **Leverage**: 5× (conservative)
 - **SL**: 1.5× ATR below/above entry
 - **TP1**: 2.5× ATR — 50% partial exit
@@ -73,6 +73,8 @@ Binance MAINNET (market data, read-only)
 - **Trailing stop**: After TP1 hit, SL moves to breakeven
 - **Max positions**: 4 concurrent
 - **Max portfolio risk**: 6% total
+- **Correlation guard**: skips new entries when highly correlated exposure is already open
+- **Funding guard**: skips entries when funding is unfavorable for the trade direction
 
 ---
 
@@ -118,6 +120,12 @@ docker-compose up -d
 docker-compose logs -f
 ```
 
+### 6. Local dashboard
+```bash
+python dashboard.py
+# Open http://127.0.0.1:8080
+```
+
 ---
 
 ## File Structure
@@ -161,9 +169,16 @@ alphabot/
 | `INITIAL_CAPITAL_USDT` | `1000` | Starting paper capital |
 | `MAX_RISK_PER_TRADE` | `0.015` | 1.5% risk per trade |
 | `MAX_OPEN_POSITIONS` | `4` | Max concurrent positions |
+| `ADAPTIVE_SIZING_ENABLED` | `true` | Enable adaptive position sizing |
+| `CORRELATION_MANAGEMENT_ENABLED` | `true` | Enforce correlation exposure cap |
+| `CORRELATION_THRESHOLD` | `0.8` | Absolute return-correlation threshold |
+| `MAX_CORRELATED_POSITIONS` | `1` | Max highly-correlated open positions |
 | `PRIMARY_TF` | `15m` | Entry timeframe |
 | `HTF_1` | `1h` | Higher timeframe 1 |
 | `HTF_2` | `4h` | Higher timeframe 2 |
+| `AI_SENTIMENT_ENABLED` | `false` | Enable optional AI confidence adjustment |
+| `LOG_FORMAT` | `text` | `text` or `json` structured logs |
+| `CLOSE_ON_SHUTDOWN` | `false` | Force-close open positions during shutdown |
 | `DRY_RUN` | `false` | Skip order execution |
 
 ---

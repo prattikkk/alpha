@@ -142,4 +142,9 @@ class EnsembleStrategy:
                 f"[{len(winning_sigs)}/{len(runnable)}]: {reasons}"
             ),
             htf_bias=ref.htf_bias,
+            extra={
+                "regime": regime.value,
+                "disagreement_count": disagreement_count,
+                "disagreement_penalty": round(disagreement_penalty, 3),
+            },
         )
