@@ -53,6 +53,7 @@ class EnsembleStrategy:
             EMAAdxVolumeStrategy(),
             BreakoutMomentumStrategy(),
         ]
+        self.last_skip_reason: str = ""
 
     def generate(
         self,
@@ -61,6 +62,8 @@ class EnsembleStrategy:
         htf_df: Optional[pd.DataFrame] = None,
         htf_df2: Optional[pd.DataFrame] = None,
     ) -> Optional[Signal]:
+        self.last_skip_reason = ""
+
         regime = detect_market_regime(
             df,
             adx_period=CONFIG.strategy.adx_period,
@@ -71,6 +74,7 @@ class EnsembleStrategy:
         allowed = REGIME_ALLOWLIST.get(regime, set(WEIGHTS.keys()))
         runnable = [s for s in self._strategies if s.name in allowed]
         if not runnable:
+            self.last_skip_reason = f"regime_blocked({regime.value})"
             return None
 
         signals: list[Signal] = []
@@ -82,6 +86,7 @@ class EnsembleStrategy:
                 log.debug(f"  [{symbol}] {strat.name}: {sig.direction.value} conf={sig.confidence:.0%}")
 
         if not signals:
+            self.last_skip_reason = f"no_substrategy_signal(regime={regime.value})"
             return None
 
         # Count votes by direction
@@ -101,6 +106,10 @@ class EnsembleStrategy:
 
         if not winning_sigs:
             log.debug(f"[{symbol}] No ensemble agreement (L={len(long_sigs)} S={len(short_sigs)})")
+            self.last_skip_reason = (
+                f"no_ensemble_agreement(regime={regime.value},"
+                f"L={len(long_sigs)},S={len(short_sigs)},min={min_agree})"
+            )
             return None
 
         # Weighted confidence

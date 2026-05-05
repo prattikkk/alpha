@@ -37,6 +37,20 @@ INTERVAL_MINUTES = {
     "30m": 30, "1h": 60, "4h": 240, "1d": 1440,
 }
 
+RESAMPLE_RULES = {
+    "1m": "1min",
+    "3m": "3min",
+    "5m": "5min",
+    "15m": "15min",
+    "30m": "30min",
+    "1h": "1h",
+    "2h": "2h",
+    "4h": "4h",
+    "6h": "6h",
+    "12h": "12h",
+    "1d": "1d",
+}
+
 
 def fetch_historical(symbol: str, interval: str, days: int) -> pd.DataFrame:
     """Fetch up to `days` days of candles from Binance mainnet in chunks."""
@@ -98,6 +112,11 @@ class Backtest:
         leverage: int = 5,
         slippage_bps: float | None = None,
         spread_bps: float | None = None,
+        fee_bps: float | None = None,
+        funding_rate_8h: float | None = None,
+        maintenance_margin_rate: float | None = None,
+        liquidation_fee_bps: float | None = None,
+        conservative_ohlc_path: bool | None = None,
         max_hold_hours: float | None = None,
     ):
         self.symbol          = symbol
@@ -120,6 +139,34 @@ class Backtest:
             if spread_bps is not None
             else float(CONFIG.trading.backtest_spread_bps)
         )
+        self.taker_fee_bps   = (
+            float(fee_bps)
+            if fee_bps is not None
+            else float(CONFIG.trading.backtest_taker_fee_bps)
+        )
+        self.funding_rate_8h = max(
+            0.0,
+            float(funding_rate_8h)
+            if funding_rate_8h is not None
+            else float(CONFIG.trading.backtest_funding_rate_8h),
+        )
+        self.maintenance_margin_rate = max(
+            0.0,
+            float(maintenance_margin_rate)
+            if maintenance_margin_rate is not None
+            else float(CONFIG.trading.backtest_maintenance_margin_rate),
+        )
+        self.liquidation_fee_bps = max(
+            0.0,
+            float(liquidation_fee_bps)
+            if liquidation_fee_bps is not None
+            else float(CONFIG.trading.backtest_liquidation_fee_bps),
+        )
+        self.conservative_ohlc_path = (
+            bool(conservative_ohlc_path)
+            if conservative_ohlc_path is not None
+            else bool(CONFIG.trading.backtest_conservative_ohlc_path)
+        )
         hold_hours = (
             float(max_hold_hours)
             if max_hold_hours is not None
@@ -136,6 +183,9 @@ class Backtest:
 
         log.info(f"Got {len(df)} candles. Running backtest…")
 
+        htf_1_full = self._build_htf_frame(df, CONFIG.strategy.htf_1)
+        htf_2_full = self._build_htf_frame(df, CONFIG.strategy.htf_2)
+
         trades = []
         balance = self.capital
         warmup = 60  # bars needed before signaling
@@ -144,7 +194,16 @@ class Backtest:
             # Keep one extra bar in the window so strategy closed-bar indexing (-2)
             # aligns with live behavior where newest candle can still be in-flight.
             window = df.iloc[: i + 1].copy()
-            signal = self.strategy.generate(self.symbol, window)
+            end_time = window.index[-1]
+            htf_1_window = self._slice_htf_window(htf_1_full, end_time)
+            htf_2_window = self._slice_htf_window(htf_2_full, end_time)
+
+            signal = self.strategy.generate(
+                self.symbol,
+                window,
+                htf_1_window,
+                htf_2_window,
+            )
             if signal is None or not signal.is_valid:
                 continue
 
@@ -163,7 +222,7 @@ class Backtest:
             if outcome is None:
                 continue
 
-            pnl, exit_price, bars_held, reason = outcome
+            pnl, exit_price, bars_held, reason, funding_cost = outcome
             balance += pnl
 
             trades.append({
@@ -177,6 +236,8 @@ class Backtest:
                 "pnl":         pnl,
                 "slippage_bps": self.slippage_bps,
                 "spread_bps": self.spread_bps,
+                "fee_bps": self.taker_fee_bps,
+                "funding_cost": funding_cost,
                 "balance":     balance,
                 "reason":      reason,
                 "rr":          signal.risk_reward,
@@ -189,60 +250,197 @@ class Backtest:
         return self._report(trades, balance)
 
     def _simulate_exit(self, df, entry_bar, signal, qty, entry_price):
-        """Walk forward to find first SL/TP hit."""
+        """Walk forward to find first SL/TP/liquidation hit."""
         direction = signal.direction
-        entry     = entry_price
-        sl        = signal.stop_loss
-        tp1       = signal.take_profit_1
-        tp2       = signal.take_profit_2
-        tp1_hit   = False
+        entry = entry_price
+        sl = signal.stop_loss
+        tp1 = signal.take_profit_1
+        tp2 = signal.take_profit_2
+        tp1_hit = False
         partial_pnl = 0.0
+        initial_qty = qty
+        liquidation_price = self._liquidation_price(entry, direction)
 
         max_exit_bar = min(entry_bar + self.max_hold_bars, len(df) - 1)
         for j in range(entry_bar + 1, max_exit_bar + 1):
             bar = df.iloc[j]
-            h, l = bar["high"], bar["low"]
+            high, low = bar["high"], bar["low"]
             bars = j - entry_bar
 
+            if self._liquidation_hit(direction, high, low, liquidation_price):
+                liq_fill = self._apply_liquidation_fill(liquidation_price, direction)
+                return self._finalize_exit(
+                    direction=direction,
+                    entry=entry,
+                    qty_remaining=qty,
+                    partial_pnl=partial_pnl,
+                    bars_held=bars,
+                    reason="LIQUIDATION",
+                    initial_qty=initial_qty,
+                    fill_override=liq_fill,
+                )
+
             if direction == Direction.LONG:
-                if not tp1_hit and h >= tp1:
-                    tp1_fill = self._apply_exit_cost(tp1, direction, is_stop=False)
-                    partial_pnl = (tp1_fill - entry) * qty * 0.5
-                    qty *= 0.5
-                    tp1_hit = True
-                if h >= tp2:
-                    tp2_fill = self._apply_exit_cost(tp2, direction, is_stop=False)
-                    total = partial_pnl + (tp2_fill - entry) * qty
-                    return total, tp2_fill, bars, "TP2"
-                if l <= sl:
-                    sl_fill = self._apply_exit_cost(sl, direction, is_stop=True)
-                    total = partial_pnl + (sl_fill - entry) * qty
-                    return total, sl_fill, bars, "SL"
+                sl_hit = low <= sl
+                tp1_now = (not tp1_hit) and high >= tp1
+
+                if not tp1_hit:
+                    if sl_hit and tp1_now and self.conservative_ohlc_path:
+                        return self._finalize_exit(
+                            direction=direction,
+                            entry=entry,
+                            qty_remaining=qty,
+                            partial_pnl=partial_pnl,
+                            bars_held=bars,
+                            reason="SL",
+                            initial_qty=initial_qty,
+                            target_price=sl,
+                            is_stop=True,
+                        )
+                    if sl_hit:
+                        return self._finalize_exit(
+                            direction=direction,
+                            entry=entry,
+                            qty_remaining=qty,
+                            partial_pnl=partial_pnl,
+                            bars_held=bars,
+                            reason="SL",
+                            initial_qty=initial_qty,
+                            target_price=sl,
+                            is_stop=True,
+                        )
+                    if tp1_now:
+                        tp1_fill = self._apply_exit_cost(tp1, direction, is_stop=False)
+                        partial_pnl = (tp1_fill - entry) * qty * 0.5
+                        qty *= 0.5
+                        tp1_hit = True
+
+                tp2_now = high >= tp2
+                sl_hit = low <= sl
+                if sl_hit and tp2_now and self.conservative_ohlc_path:
+                    return self._finalize_exit(
+                        direction=direction,
+                        entry=entry,
+                        qty_remaining=qty,
+                        partial_pnl=partial_pnl,
+                        bars_held=bars,
+                        reason="SL",
+                        initial_qty=initial_qty,
+                        target_price=sl,
+                        is_stop=True,
+                    )
+                if sl_hit:
+                    return self._finalize_exit(
+                        direction=direction,
+                        entry=entry,
+                        qty_remaining=qty,
+                        partial_pnl=partial_pnl,
+                        bars_held=bars,
+                        reason="SL",
+                        initial_qty=initial_qty,
+                        target_price=sl,
+                        is_stop=True,
+                    )
+                if tp2_now:
+                    return self._finalize_exit(
+                        direction=direction,
+                        entry=entry,
+                        qty_remaining=qty,
+                        partial_pnl=partial_pnl,
+                        bars_held=bars,
+                        reason="TP2",
+                        initial_qty=initial_qty,
+                        target_price=tp2,
+                        is_stop=False,
+                    )
+
             else:
-                if not tp1_hit and l <= tp1:
-                    tp1_fill = self._apply_exit_cost(tp1, direction, is_stop=False)
-                    partial_pnl = (entry - tp1_fill) * qty * 0.5
-                    qty *= 0.5
-                    tp1_hit = True
-                if l <= tp2:
-                    tp2_fill = self._apply_exit_cost(tp2, direction, is_stop=False)
-                    total = partial_pnl + (entry - tp2_fill) * qty
-                    return total, tp2_fill, bars, "TP2"
-                if h >= sl:
-                    sl_fill = self._apply_exit_cost(sl, direction, is_stop=True)
-                    total = partial_pnl + (entry - sl_fill) * qty
-                    return total, sl_fill, bars, "SL"
+                sl_hit = high >= sl
+                tp1_now = (not tp1_hit) and low <= tp1
+
+                if not tp1_hit:
+                    if sl_hit and tp1_now and self.conservative_ohlc_path:
+                        return self._finalize_exit(
+                            direction=direction,
+                            entry=entry,
+                            qty_remaining=qty,
+                            partial_pnl=partial_pnl,
+                            bars_held=bars,
+                            reason="SL",
+                            initial_qty=initial_qty,
+                            target_price=sl,
+                            is_stop=True,
+                        )
+                    if sl_hit:
+                        return self._finalize_exit(
+                            direction=direction,
+                            entry=entry,
+                            qty_remaining=qty,
+                            partial_pnl=partial_pnl,
+                            bars_held=bars,
+                            reason="SL",
+                            initial_qty=initial_qty,
+                            target_price=sl,
+                            is_stop=True,
+                        )
+                    if tp1_now:
+                        tp1_fill = self._apply_exit_cost(tp1, direction, is_stop=False)
+                        partial_pnl = (entry - tp1_fill) * qty * 0.5
+                        qty *= 0.5
+                        tp1_hit = True
+
+                tp2_now = low <= tp2
+                sl_hit = high >= sl
+                if sl_hit and tp2_now and self.conservative_ohlc_path:
+                    return self._finalize_exit(
+                        direction=direction,
+                        entry=entry,
+                        qty_remaining=qty,
+                        partial_pnl=partial_pnl,
+                        bars_held=bars,
+                        reason="SL",
+                        initial_qty=initial_qty,
+                        target_price=sl,
+                        is_stop=True,
+                    )
+                if sl_hit:
+                    return self._finalize_exit(
+                        direction=direction,
+                        entry=entry,
+                        qty_remaining=qty,
+                        partial_pnl=partial_pnl,
+                        bars_held=bars,
+                        reason="SL",
+                        initial_qty=initial_qty,
+                        target_price=sl,
+                        is_stop=True,
+                    )
+                if tp2_now:
+                    return self._finalize_exit(
+                        direction=direction,
+                        entry=entry,
+                        qty_remaining=qty,
+                        partial_pnl=partial_pnl,
+                        bars_held=bars,
+                        reason="TP2",
+                        initial_qty=initial_qty,
+                        target_price=tp2,
+                        is_stop=False,
+                    )
 
         # Timeout — exit at last close
         last = df.iloc[max_exit_bar]
-        close = last["close"]
-        exit_fill = self._apply_exit_cost(close, direction, is_stop=False)
-        bars_held = max_exit_bar - entry_bar
-        if direction == Direction.LONG:
-            total = partial_pnl + (exit_fill - entry) * qty
-        else:
-            total = partial_pnl + (entry - exit_fill) * qty
-        return total, exit_fill, bars_held, "TIMEOUT"
+        return self._finalize_exit(
+            direction=direction,
+            entry=entry,
+            qty_remaining=qty,
+            partial_pnl=partial_pnl,
+            bars_held=max_exit_bar - entry_bar,
+            reason="TIMEOUT",
+            initial_qty=initial_qty,
+            target_price=float(last["close"]),
+            is_stop=False,
+        )
 
     def _report(self, trades: list, final_balance: float) -> dict:
         if not trades:
@@ -263,11 +461,17 @@ class Backtest:
             "days":          self.days,
             "slippage_bps":  self.slippage_bps,
             "spread_bps":    self.spread_bps,
+            "fee_bps":       self.taker_fee_bps,
+            "funding_rate_8h": self.funding_rate_8h,
+            "maintenance_margin_rate": self.maintenance_margin_rate,
+            "liquidation_fee_bps": self.liquidation_fee_bps,
+            "conservative_ohlc_path": self.conservative_ohlc_path,
             "max_hold_bars": self.max_hold_bars,
             "total_trades":  len(tdf),
             "win_rate":      round(wr, 1),
             "profit_factor": round(pf, 2),
             "total_pnl":     round(tdf["pnl"].sum(), 2),
+            "total_funding_cost": round(tdf["funding_cost"].sum(), 2),
             "avg_win":       round(wins["pnl"].mean(), 2) if not wins.empty else 0,
             "avg_loss":      round(losses["pnl"].mean(), 2) if not losses.empty else 0,
             "max_drawdown":  round(max_dd, 2),
@@ -275,6 +479,7 @@ class Backtest:
             "return_pct":    round((final_balance - self.capital) / self.capital * 100, 1),
             "tp2_rate":      round(len(tdf[tdf["reason"]=="TP2"]) / len(tdf) * 100, 1),
             "sl_rate":       round(len(tdf[tdf["reason"]=="SL"]) / len(tdf) * 100, 1),
+            "liquidation_rate": round(len(tdf[tdf["reason"]=="LIQUIDATION"]) / len(tdf) * 100, 1),
         }
 
         # Print
@@ -311,20 +516,145 @@ class Backtest:
         minutes = INTERVAL_MINUTES.get(self.interval, 15)
         return max(1, int((hours * 60) / minutes))
 
+    def _build_htf_frame(self, base_df: pd.DataFrame, target_interval: str | None) -> pd.DataFrame | None:
+        if not target_interval:
+            return None
+
+        target_interval = str(target_interval)
+        if target_interval == self.interval:
+            return base_df
+
+        base_minutes = INTERVAL_MINUTES.get(self.interval)
+        target_minutes = INTERVAL_MINUTES.get(target_interval)
+        rule = RESAMPLE_RULES.get(target_interval)
+        if not base_minutes or not target_minutes or not rule:
+            return None
+        if target_minutes < base_minutes or target_minutes % base_minutes != 0:
+            return None
+
+        agg = {
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum",
+        }
+        for col in ("quote_volume", "trades", "taker_buy_base", "taker_buy_quote"):
+            if col in base_df.columns:
+                agg[col] = "sum"
+
+        htf = base_df.resample(rule).agg(agg)
+        htf = htf.dropna(subset=["open", "high", "low", "close"])
+
+        if "taker_buy_base" in htf.columns and "volume" in htf.columns:
+            htf["taker_ratio"] = np.where(
+                htf["volume"] > 0,
+                htf["taker_buy_base"] / htf["volume"],
+                np.nan,
+            )
+
+        return htf
+
+    @staticmethod
+    def _slice_htf_window(htf_df: pd.DataFrame | None, end_time: pd.Timestamp) -> pd.DataFrame | None:
+        if htf_df is None:
+            return None
+        window = htf_df.loc[htf_df.index <= end_time]
+        return window if not window.empty else None
+
+    def _fee_rate(self) -> float:
+        return self.taker_fee_bps / 10000.0
+
     def _apply_entry_cost(self, price: float, direction: Direction) -> float:
         half_spread = self.spread_bps / 20000.0
         slip = self.slippage_bps / 10000.0
+        fee_rate = self._fee_rate()
         if direction == Direction.LONG:
-            return price * (1 + half_spread + slip)
-        return price * (1 - half_spread - slip)
+            return price * (1 + half_spread + slip) * (1 + fee_rate)
+        return price * (1 - half_spread - slip) * (1 - fee_rate)
 
     def _apply_exit_cost(self, price: float, direction: Direction, is_stop: bool) -> float:
         half_spread = self.spread_bps / 20000.0
         slip = self.slippage_bps / 10000.0
         impact = slip * (1.5 if is_stop else 1.0)
+        fee_rate = self._fee_rate()
         if direction == Direction.LONG:
-            return price * (1 - half_spread - impact)
-        return price * (1 + half_spread + impact)
+            return price * (1 - half_spread - impact) * (1 - fee_rate)
+        return price * (1 + half_spread + impact) * (1 + fee_rate)
+
+    def _funding_cost(self, entry_price: float, quantity: float, bars_held: int) -> float:
+        if self.funding_rate_8h <= 0 or bars_held <= 0 or quantity <= 0:
+            return 0.0
+        minutes_per_bar = INTERVAL_MINUTES.get(self.interval, 15)
+        hold_hours = (bars_held * minutes_per_bar) / 60.0
+        return entry_price * quantity * self.funding_rate_8h * (hold_hours / 8.0)
+
+    def _liquidation_price(self, entry_price: float, direction: Direction) -> float | None:
+        if self.leverage <= 0:
+            return None
+
+        move_fraction = (1.0 / float(self.leverage)) - self.maintenance_margin_rate
+        if move_fraction <= 0:
+            return None
+
+        move_fraction = min(move_fraction, 0.99)
+        if direction == Direction.LONG:
+            return max(0.0, entry_price * (1.0 - move_fraction))
+        return entry_price * (1.0 + move_fraction)
+
+    @staticmethod
+    def _liquidation_hit(direction: Direction, high: float, low: float, liquidation_price: float | None) -> bool:
+        if liquidation_price is None:
+            return False
+        if direction == Direction.LONG:
+            return low <= liquidation_price
+        return high >= liquidation_price
+
+    def _apply_liquidation_fill(self, liquidation_price: float, direction: Direction) -> float:
+        penalty = self.liquidation_fee_bps / 10000.0
+        if direction == Direction.LONG:
+            penalized = liquidation_price * (1.0 - penalty)
+        else:
+            penalized = liquidation_price * (1.0 + penalty)
+        return self._apply_exit_cost(penalized, direction, is_stop=True)
+
+    @staticmethod
+    def _realized_pnl(direction: Direction, entry: float, exit_fill: float, qty_remaining: float, partial_pnl: float) -> float:
+        if direction == Direction.LONG:
+            return partial_pnl + (exit_fill - entry) * qty_remaining
+        return partial_pnl + (entry - exit_fill) * qty_remaining
+
+    def _finalize_exit(
+        self,
+        *,
+        direction: Direction,
+        entry: float,
+        qty_remaining: float,
+        partial_pnl: float,
+        bars_held: int,
+        reason: str,
+        initial_qty: float,
+        target_price: float | None = None,
+        is_stop: bool = False,
+        fill_override: float | None = None,
+    ):
+        if fill_override is not None:
+            exit_fill = fill_override
+        else:
+            if target_price is None:
+                raise ValueError("target_price is required when fill_override is not provided")
+            exit_fill = self._apply_exit_cost(target_price, direction, is_stop=is_stop)
+
+        gross_pnl = self._realized_pnl(
+            direction=direction,
+            entry=entry,
+            exit_fill=exit_fill,
+            qty_remaining=qty_remaining,
+            partial_pnl=partial_pnl,
+        )
+        funding_cost = self._funding_cost(entry, initial_qty, bars_held)
+        net_pnl = gross_pnl - funding_cost
+        return net_pnl, exit_fill, bars_held, reason, funding_cost
 
 
 if __name__ == "__main__":
@@ -348,6 +678,42 @@ if __name__ == "__main__":
         help="Bid/ask spread in basis points",
     )
     parser.add_argument(
+        "--fee-bps",
+        type=float,
+        default=CONFIG.trading.backtest_taker_fee_bps,
+        help="Per-side taker fee in basis points",
+    )
+    parser.add_argument(
+        "--funding-rate-8h",
+        type=float,
+        default=CONFIG.trading.backtest_funding_rate_8h,
+        help="Funding charge rate per 8 hours",
+    )
+    parser.add_argument(
+        "--maintenance-margin-rate",
+        type=float,
+        default=CONFIG.trading.backtest_maintenance_margin_rate,
+        help="Approximate maintenance margin ratio for liquidation modeling",
+    )
+    parser.add_argument(
+        "--liquidation-fee-bps",
+        type=float,
+        default=CONFIG.trading.backtest_liquidation_fee_bps,
+        help="Additional liquidation penalty in basis points",
+    )
+    parser.add_argument(
+        "--conservative-ohlc-path",
+        action="store_true",
+        default=CONFIG.trading.backtest_conservative_ohlc_path,
+        help="If TP and SL are hit in the same candle, prioritize SL",
+    )
+    parser.add_argument(
+        "--non-conservative-ohlc-path",
+        action="store_false",
+        dest="conservative_ohlc_path",
+        help="Disable conservative same-candle conflict handling",
+    )
+    parser.add_argument(
         "--max-hold-hours",
         type=float,
         default=CONFIG.trading.backtest_max_hold_hours,
@@ -363,6 +729,11 @@ if __name__ == "__main__":
         initial_capital=args.capital,
         slippage_bps=args.slippage_bps,
         spread_bps=args.spread_bps,
+        fee_bps=args.fee_bps,
+        funding_rate_8h=args.funding_rate_8h,
+        maintenance_margin_rate=args.maintenance_margin_rate,
+        liquidation_fee_bps=args.liquidation_fee_bps,
+        conservative_ohlc_path=args.conservative_ohlc_path,
         max_hold_hours=args.max_hold_hours,
     )
     bt.run()

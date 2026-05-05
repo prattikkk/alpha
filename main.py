@@ -400,19 +400,24 @@ class TradingBot:
             log.warning("Runtime pause is active; skipping new entries this cycle")
 
         eligible_symbols: list[str] = []
+        cycle_rejections: dict[str, str] = {}
+        opened_symbols: set[str] = set()
 
         for symbol in self.symbols:
             if halt_new_entries:
-                break
+                self._record_cycle_rejection(cycle_rejections, symbol, "global_halt_new_entries")
+                continue
 
             if symbol in self.portfolio.open_positions:
                 log.debug("[%s] position already open, skipping new entry", symbol)
+                self._record_cycle_rejection(cycle_rejections, symbol, "already_open_position")
                 continue
 
             if min_volume_24h > 0:
                 quote_volume = self.fetcher.get_24h_quote_volume(symbol)
                 if quote_volume is None:
                     log.warning("[%s] 24h quote volume unavailable, skipping", symbol)
+                    self._record_cycle_rejection(cycle_rejections, symbol, "volume_unavailable")
                     continue
                 if quote_volume < min_volume_24h:
                     log.info(
@@ -420,6 +425,11 @@ class TradingBot:
                         symbol,
                         quote_volume,
                         min_volume_24h,
+                    )
+                    self._record_cycle_rejection(
+                        cycle_rejections,
+                        symbol,
+                        f"volume_below_min({quote_volume:.0f}<{min_volume_24h:.0f})",
                     )
                     continue
 
@@ -454,9 +464,18 @@ class TradingBot:
                         candidate = future.result()
                     except Exception as e:
                         log.error("[%s] signal generation failed: %s", symbol, e)
+                        self._record_cycle_rejection(cycle_rejections, symbol, "signal_generation_error")
                         continue
-                    if candidate is not None:
-                        signal_candidates.append(candidate)
+                    if candidate is None:
+                        self._record_cycle_rejection(cycle_rejections, symbol, "signal_generation_empty")
+                        continue
+
+                    rejection_reason = candidate.get("rejection_reason")
+                    if rejection_reason:
+                        self._record_cycle_rejection(cycle_rejections, symbol, str(rejection_reason))
+                        continue
+
+                    signal_candidates.append(candidate)
 
         signal_candidates.sort(key=lambda item: self._symbol_order.get(item["symbol"], 10**9))
 
@@ -486,6 +505,11 @@ class TradingBot:
                             funding_rate,
                             funding_threshold,
                         )
+                        self._record_cycle_rejection(
+                            cycle_rejections,
+                            symbol,
+                            f"funding_unfavorable_long({funding_rate:.5f}>{funding_threshold:.5f})",
+                        )
                         continue
                     if signal.direction == Direction.SHORT and funding_rate < -funding_threshold:
                         log.info(
@@ -494,9 +518,16 @@ class TradingBot:
                             funding_rate,
                             funding_threshold,
                         )
+                        self._record_cycle_rejection(
+                            cycle_rejections,
+                            symbol,
+                            f"funding_unfavorable_short({funding_rate:.5f}<-{funding_threshold:.5f})",
+                        )
                         continue
 
-            if self._is_correlation_blocked(symbol, primary_tf, corr_matrix):
+            correlation_reason = self._is_correlation_blocked(symbol, primary_tf, corr_matrix)
+            if correlation_reason:
+                self._record_cycle_rejection(cycle_rejections, symbol, correlation_reason)
                 continue
 
             if self.ai_sentiment.enabled:
@@ -508,6 +539,10 @@ class TradingBot:
                     signal.reason = f"{signal.reason} | ai_adj={ai_adj:+.2f}"
                     if not self._signal_is_tradeable(signal, min_confidence):
                         log.info("[%s] AI sentiment reduced confidence below threshold", symbol)
+                        rejection_reason = self._signal_rejection_reason(signal, min_confidence)
+                        if rejection_reason is None:
+                            rejection_reason = "ai_adjustment_rejected"
+                        self._record_cycle_rejection(cycle_rejections, symbol, rejection_reason)
                         continue
 
             log.info(
@@ -522,10 +557,12 @@ class TradingBot:
             exchange_info = self.fetcher.get_exchange_info(symbol)
             if not exchange_info:
                 log.warning("[%s] exchange info unavailable, skipping", symbol)
+                self._record_cycle_rejection(cycle_rejections, symbol, "exchange_info_unavailable")
                 continue
 
             position = self.risk.size_position(signal, exchange_info)
             if position is None:
+                self._record_cycle_rejection(cycle_rejections, symbol, "risk_sizing_rejected")
                 continue
 
             if self.dry_run:
@@ -540,9 +577,11 @@ class TradingBot:
                 order_ids = self.executor.open_position(position)
                 if not order_ids or not order_ids.get("entry"):
                     log.warning("[%s] order placement failed, skipping portfolio open", symbol)
+                    self._record_cycle_rejection(cycle_rejections, symbol, "order_placement_failed")
                     continue
 
             self.portfolio.open_position(position, signal, order_ids)
+            opened_symbols.add(symbol)
             notify_trade_open(
                 symbol=symbol,
                 direction=signal.direction.value,
@@ -550,6 +589,8 @@ class TradingBot:
                 qty=position.quantity,
                 notional=position.notional_usdt,
             )
+
+        self._log_cycle_rejection_summary(cycle_rejections, opened_symbols)
 
         stats = self.portfolio.stats()
         log.info(
@@ -572,7 +613,11 @@ class TradingBot:
         df = multi_tf.get(primary_tf)
         if df is None or len(df) < 120:
             log.warning("[%s] not enough %s data to evaluate", symbol, primary_tf)
-            return None
+            observed = 0 if df is None else len(df)
+            return {
+                "symbol": symbol,
+                "rejection_reason": f"insufficient_{primary_tf}_data({observed}<120)",
+            }
 
         strategy = self.strategy_cls()
         signal = strategy.generate(
@@ -582,17 +627,25 @@ class TradingBot:
             htf_df2=multi_tf.get(htf_2),
         )
         if signal is None:
-            return None
+            skip_reason = str(getattr(strategy, "last_skip_reason", "")).strip()
+            return {
+                "symbol": symbol,
+                "rejection_reason": skip_reason or "strategy_no_signal",
+            }
 
-        if not self._signal_is_tradeable(signal, min_confidence):
+        rejection_reason = self._signal_rejection_reason(signal, min_confidence)
+        if rejection_reason:
             log.info(
                 "[%s] signal rejected | conf=%.2f | rr=%.2f | reason=%s",
                 symbol,
                 signal.confidence,
                 signal.risk_reward,
-                signal.reason,
+                rejection_reason,
             )
-            return None
+            return {
+                "symbol": symbol,
+                "rejection_reason": rejection_reason,
+            }
 
         return {
             "symbol": symbol,
@@ -600,29 +653,61 @@ class TradingBot:
             "df": df,
         }
 
+    def _signal_is_tradeable(self, signal, min_confidence: float) -> bool:
+        return self._signal_rejection_reason(signal, min_confidence) is None
+
     @staticmethod
-    def _signal_is_tradeable(signal, min_confidence: float) -> bool:
-        return (
-            signal.direction != Direction.FLAT
-            and signal.confidence >= float(min_confidence)
-            and signal.risk_reward >= CONFIG.risk.min_rr_ratio
-            and signal.stop_loss > 0
-            and signal.take_profit_1 > 0
-            and signal.take_profit_2 > 0
-        )
+    def _signal_rejection_reason(signal, min_confidence: float) -> str | None:
+        min_conf = float(min_confidence)
+        min_rr = float(CONFIG.risk.min_rr_ratio)
+
+        if signal.direction == Direction.FLAT:
+            return "direction_flat"
+        if signal.confidence < min_conf:
+            return f"confidence_below_min({signal.confidence:.2f}<{min_conf:.2f})"
+        if signal.risk_reward < min_rr:
+            return f"rr_below_min({signal.risk_reward:.2f}<{min_rr:.2f})"
+        if signal.stop_loss <= 0:
+            return "invalid_stop_loss"
+        if signal.take_profit_1 <= 0:
+            return "invalid_take_profit_1"
+        if signal.take_profit_2 <= 0:
+            return "invalid_take_profit_2"
+        return None
+
+    @staticmethod
+    def _record_cycle_rejection(cycle_rejections: dict[str, str], symbol: str, reason: str) -> None:
+        if symbol not in cycle_rejections:
+            cycle_rejections[symbol] = reason
+
+    def _log_cycle_rejection_summary(self, cycle_rejections: dict[str, str], opened_symbols: set[str]) -> None:
+        skipped_entries: list[str] = []
+        for symbol in self.symbols:
+            if symbol in opened_symbols:
+                continue
+            reason = cycle_rejections.get(symbol)
+            if reason is None:
+                reason = "no_entry_taken"
+            skipped_entries.append(f"{symbol}:{reason}")
+
+        if not skipped_entries:
+            log.info("Cycle rejection summary | no skipped symbols")
+            return
+
+        log.info("Cycle rejection summary | %s", " | ".join(skipped_entries))
 
     def _is_correlation_blocked(
         self,
         candidate_symbol: str,
         interval: str,
         corr_matrix: dict[tuple[str, str], float] | None = None,
-    ) -> bool:
+    ) -> str | None:
         if not bool(CONFIG.risk.correlation_management_enabled):
-            return False
+            return None
 
         open_symbols = [s for s in self.portfolio.open_positions.keys() if s != candidate_symbol]
         if not open_symbols:
-            return False
+            return None
 
         threshold = float(self._effective_correlation_threshold())
         lookback = int(CONFIG.risk.correlation_lookback)
@@ -657,8 +742,11 @@ class TradingBot:
                 correlated,
                 threshold,
             )
-            return True
-        return False
+            return (
+                f"correlation_cap(correlated={correlated},"
+                f"max={max_correlated},threshold={threshold:.2f})"
+            )
+        return None
 
     @staticmethod
     def _ai_context(df) -> dict:
