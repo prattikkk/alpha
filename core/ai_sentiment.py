@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from typing import Optional
@@ -62,7 +63,9 @@ class AISentimentEngine:
 
     def _score_sentiment(self, symbol: str, regime: str, context: dict) -> Optional[float]:
         prompt = (
-            "Return exactly one number between -1 and 1. "
+            "Return strict JSON only with key 'score' and a numeric value between -1 and 1. "
+            "Example: {\"score\": 0.27}. "
+            "Do not include any other numbers or text. "
             "Positive means bullish sentiment, negative means bearish sentiment. "
             f"Symbol={symbol}. Regime={regime}. Context={context}."
         )
@@ -171,11 +174,50 @@ class AISentimentEngine:
 
     @staticmethod
     def _extract_score(text: str) -> Optional[float]:
-        match = re.search(r"-?\d+(?:\.\d+)?", text or "")
-        if not match:
+        payload = (text or "").strip()
+        if not payload:
             return None
+
+        # Handle fenced code outputs from LLMs.
+        if payload.startswith("```") and payload.endswith("```"):
+            payload = payload.strip("`").strip()
+            if payload.startswith("json"):
+                payload = payload[4:].strip()
+
+        # Preferred path: strict JSON with score field.
         try:
-            value = float(match.group(0))
+            parsed = json.loads(payload)
+            if isinstance(parsed, dict):
+                for key in ("score", "sentiment_score", "sentiment"):
+                    if key in parsed:
+                        return AISentimentEngine._normalize_score(parsed[key])
+            if isinstance(parsed, (int, float, str)):
+                return AISentimentEngine._normalize_score(parsed)
+        except Exception:
+            pass
+
+        # Fallback path: explicit score assignment only.
+        key_match = re.search(
+            r"(?:^|[\s{\[,])(?:score|sentiment_score|sentiment)\s*[:=]\s*(-?\d+(?:\.\d+)?)",
+            payload,
+            flags=re.IGNORECASE,
+        )
+        if key_match:
+            return AISentimentEngine._normalize_score(key_match.group(1))
+
+        # Last-resort path: entire payload is a single numeric token.
+        numeric = payload.strip()
+        if re.fullmatch(r"-?\d+(?:\.\d+)?", numeric):
+            return AISentimentEngine._normalize_score(numeric)
+
+        return None
+
+    @staticmethod
+    def _normalize_score(raw) -> Optional[float]:
+        try:
+            value = float(raw)
         except Exception:
             return None
-        return max(-1.0, min(1.0, value))
+        if value < -1.0 or value > 1.0:
+            return None
+        return value

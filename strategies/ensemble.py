@@ -33,9 +33,11 @@ REGIME_ALLOWLIST = {
         EMAAdxVolumeStrategy.name,
     },
     MarketRegime.RANGING: {
+        SuperTrendRSIStrategy.name,
         BreakoutMomentumStrategy.name,
     },
     MarketRegime.HIGH_VOL: {
+        EMAAdxVolumeStrategy.name,
         BreakoutMomentumStrategy.name,
     },
     MarketRegime.UNKNOWN: set(WEIGHTS.keys()),

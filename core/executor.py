@@ -168,6 +168,10 @@ class TestnetExecutor:
     def get_order_status(self, symbol: str, order_id: int) -> Optional[dict]:
         return self._signed_get("/fapi/v1/order", {"symbol": symbol, "orderId": order_id})
 
+    @property
+    def has_credentials(self) -> bool:
+        return bool(self.api_key and self.api_secret)
+
     def get_open_positions(self, symbols: Optional[list[str]] = None) -> dict[str, dict]:
         """Get non-zero futures positions keyed by symbol."""
         account = self.get_account()
@@ -237,6 +241,47 @@ class TestnetExecutor:
             quantity=quantity,
         )
         return close_order is not None
+
+    def place_trailing_stop(
+        self,
+        symbol: str,
+        direction: Direction | str,
+        quantity: float,
+        callback_rate_pct: float,
+        activation_price: float | None = None,
+    ) -> Optional[str | int]:
+        """Create exchange-side trailing stop to protect the remaining position."""
+        if not self.has_credentials:
+            return "DRY_RUN"
+
+        qty = self._round_qty(quantity, symbol)
+        if qty <= 0:
+            return None
+
+        close_side = "SELL" if self._is_long(direction) else "BUY"
+        callback = max(0.1, min(10.0, float(callback_rate_pct)))
+
+        params = {
+            "symbol": symbol,
+            "side": close_side,
+            "type": "TRAILING_STOP_MARKET",
+            "quantity": qty,
+            "callbackRate": round(callback, 2),
+            "workingType": "CONTRACT_PRICE",
+            "reduceOnly": "true",
+        }
+        if activation_price is not None and activation_price > 0:
+            params["activationPrice"] = self._tick_round(float(activation_price), symbol)
+
+        resp = self._signed_post("/fapi/v1/order", params)
+        if not resp:
+            # Some account modes reject reduceOnly for trailing stops.
+            params.pop("reduceOnly", None)
+            resp = self._signed_post("/fapi/v1/order", params)
+
+        if not resp:
+            return None
+        return resp.get("orderId")
 
     # ------------------------------------------------------------------ #
     # Internal helpers

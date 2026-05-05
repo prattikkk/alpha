@@ -5,25 +5,46 @@ from __future__ import annotations
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
 from config import CONFIG
+from core.control_plane import enqueue_command, get_control_state, set_paused, update_control_state
 
 PORTFOLIO_PATH = Path("data/portfolio.json")
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path.startswith("/api/state"):
-            self._send_json(_load_state())
+        path = urlparse(self.path).path
+        if path == "/api/state":
+            self._send_json(_load_dashboard_state())
+            return
+        if path == "/api/control":
+            self._send_json({"ok": True, "control": get_control_state()})
             return
         self._send_html(_render_html())
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path != "/api/control":
+            self._send_json({"ok": False, "error": "Unsupported endpoint"}, status=404)
+            return
+
+        body = self._read_json_body()
+        action = str(body.get("action", "")).strip().lower()
+        payload = body.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+
+        response = _handle_control_action(action, payload)
+        self._send_json(response, status=200 if response.get("ok") else 400)
 
     def log_message(self, format, *args):
         return
 
-    def _send_json(self, payload: dict):
+    def _send_json(self, payload: dict, status: int = 200):
         encoded = json.dumps(payload, ensure_ascii=True).encode("utf-8")
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
@@ -37,6 +58,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def _read_json_body(self) -> dict:
+        try:
+            raw_len = self.headers.get("Content-Length", "0")
+            content_length = int(raw_len)
+        except Exception:
+            content_length = 0
+
+        if content_length <= 0:
+            return {}
+
+        try:
+            payload = self.rfile.read(content_length)
+            data = json.loads(payload.decode("utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
 
 def _load_state() -> dict:
     if not PORTFOLIO_PATH.exists():
@@ -45,6 +83,79 @@ def _load_state() -> dict:
         return json.loads(PORTFOLIO_PATH.read_text(encoding="utf-8"))
     except Exception:
         return {"balance": 0.0, "open_positions": {}, "closed_trades": []}
+
+
+def _to_float(value, min_value: float, max_value: float) -> float | None:
+    try:
+        parsed = float(value)
+    except Exception:
+        return None
+    if parsed < min_value or parsed > max_value:
+        return None
+    return parsed
+
+
+def _to_int(value, min_value: int, max_value: int) -> int | None:
+    try:
+        parsed = int(value)
+    except Exception:
+        return None
+    if parsed < min_value or parsed > max_value:
+        return None
+    return parsed
+
+
+def _load_dashboard_state() -> dict:
+    payload = _load_state()
+    payload["control"] = get_control_state()
+    return payload
+
+
+def _handle_control_action(action: str, payload: dict) -> dict:
+    if action == "pause":
+        state = set_paused(True)
+        return {"ok": True, "control": state}
+
+    if action == "resume":
+        state = set_paused(False)
+        return {"ok": True, "control": state}
+
+    if action == "close_symbol":
+        symbol = str(payload.get("symbol", "")).strip().upper()
+        if not symbol:
+            return {"ok": False, "error": "symbol is required"}
+        command = enqueue_command("close_symbol", {"symbol": symbol})
+        return {"ok": True, "queued": command, "control": get_control_state()}
+
+    if action == "close_all":
+        command = enqueue_command("close_all", {})
+        return {"ok": True, "queued": command, "control": get_control_state()}
+
+    if action == "set_overrides":
+        overrides: dict = {}
+
+        if "min_confidence" in payload:
+            val = _to_float(payload.get("min_confidence"), 0.0, 1.0)
+            if val is None:
+                return {"ok": False, "error": "min_confidence must be between 0 and 1"}
+            overrides["min_confidence"] = val
+
+        if "correlation_threshold" in payload:
+            val = _to_float(payload.get("correlation_threshold"), 0.0, 1.0)
+            if val is None:
+                return {"ok": False, "error": "correlation_threshold must be between 0 and 1"}
+            overrides["correlation_threshold"] = val
+
+        if "max_correlated_positions" in payload:
+            val = _to_int(payload.get("max_correlated_positions"), 1, 20)
+            if val is None:
+                return {"ok": False, "error": "max_correlated_positions must be 1..20"}
+            overrides["max_correlated_positions"] = val
+
+        state = update_control_state(overrides=overrides)
+        return {"ok": True, "control": state}
+
+    return {"ok": False, "error": f"unsupported action: {action}"}
 
 
 def _render_html() -> str:
@@ -159,6 +270,82 @@ def _render_html() -> str:
       overflow: hidden;
     }
 
+    .controls {
+      display: grid;
+      grid-template-columns: 1.2fr 1fr;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+
+    .control-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
+
+    .control-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr auto;
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .status-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 0.82rem;
+      border: 1px solid var(--line);
+      background: #f7fbff;
+      color: #0e4362;
+      margin-top: 6px;
+    }
+
+    .status-chip.paused {
+      background: #fff7ed;
+      color: #9a3412;
+      border-color: #fed7aa;
+    }
+
+    button {
+      border: 1px solid #c9d9e8;
+      background: #fdfefe;
+      color: #173f5f;
+      border-radius: 10px;
+      padding: 8px 12px;
+      font-family: inherit;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    button:hover { filter: brightness(0.98); }
+    button.warn { color: #9a3412; border-color: #fecaca; background: #fff5f5; }
+    button.strong { color: #ffffff; border-color: #05668d; background: #05668d; }
+
+    input {
+      width: 100%;
+      border: 1px solid #c9d9e8;
+      border-radius: 10px;
+      padding: 8px 10px;
+      font-family: inherit;
+      color: #173f5f;
+      background: #ffffff;
+    }
+
+    .inline-actions {
+      display: inline-flex;
+      gap: 6px;
+    }
+
+    .small-btn {
+      padding: 5px 8px;
+      font-size: 0.76rem;
+      border-radius: 8px;
+    }
+
     h2 {
       margin: 4px 6px 10px;
       font-size: 1rem;
@@ -193,6 +380,8 @@ def _render_html() -> str:
 
     @media (max-width: 740px) {
       .wrap { padding: 14px 10px 18px; }
+      .controls { grid-template-columns: 1fr; }
+      .control-row { grid-template-columns: 1fr; }
       .panel { overflow-x: auto; }
       th, td { padding: 8px 7px; }
     }
@@ -221,10 +410,32 @@ def _render_html() -> str:
       <div class=\"card\"><div class=\"metric\">Closed Trades</div><strong class=\"value\" id=\"closedCount\">-</strong></div>
     </div>
 
+    <div class=\"controls\">
+      <div class=\"panel\">
+        <h2>Runtime Control</h2>
+        <div id=\"botStatus\" class=\"status-chip\">Status: running</div>
+        <div class=\"control-actions\">
+          <button class=\"warn\" onclick=\"pauseBot()\">Pause New Entries</button>
+          <button class=\"strong\" onclick=\"resumeBot()\">Resume</button>
+          <button class=\"warn\" onclick=\"closeAllPositions()\">Close All Positions</button>
+        </div>
+      </div>
+
+      <div class=\"panel\">
+        <h2>Live Overrides</h2>
+        <div class=\"control-row\">
+          <input id=\"cfgMinConfidence\" placeholder=\"Min confidence (0-1)\" />
+          <input id=\"cfgCorrThreshold\" placeholder=\"Corr threshold (0-1)\" />
+          <input id=\"cfgCorrCount\" placeholder=\"Max correlated\" />
+          <button class=\"strong\" onclick=\"applyOverrides()\">Apply</button>
+        </div>
+      </div>
+    </div>
+
     <div class=\"panel\">
       <h2>Open Positions</h2>
       <table>
-        <thead><tr><th>Symbol</th><th>Direction</th><th>Entry</th><th>SL</th><th>Qty</th><th>PnL</th></tr></thead>
+        <thead><tr><th>Symbol</th><th>Direction</th><th>Entry</th><th>SL</th><th>Qty</th><th>PnL</th><th>Action</th></tr></thead>
         <tbody id=\"openRows\"></tbody>
       </table>
     </div>
@@ -244,19 +455,82 @@ function pnlClass(v) {
   return n >= 0 ? 'pnl-pos' : 'pnl-neg';
 }
 
+async function apiControl(action, payload = {}) {
+  const r = await fetch('/api/control', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action, payload })
+  });
+  const data = await r.json();
+  if (!data.ok) {
+    alert(data.error || 'Control action failed');
+  }
+  return data;
+}
+
+async function pauseBot() {
+  await apiControl('pause');
+  await refresh();
+}
+
+async function resumeBot() {
+  await apiControl('resume');
+  await refresh();
+}
+
+async function closeSymbol(symbol) {
+  await apiControl('close_symbol', { symbol });
+  await refresh();
+}
+
+async function closeAllPositions() {
+  await apiControl('close_all');
+  await refresh();
+}
+
+async function applyOverrides() {
+  const payload = {};
+  const minConf = document.getElementById('cfgMinConfidence').value.trim();
+  const corrThr = document.getElementById('cfgCorrThreshold').value.trim();
+  const corrCnt = document.getElementById('cfgCorrCount').value.trim();
+
+  if (minConf.length > 0) payload.min_confidence = Number(minConf);
+  if (corrThr.length > 0) payload.correlation_threshold = Number(corrThr);
+  if (corrCnt.length > 0) payload.max_correlated_positions = Number(corrCnt);
+
+  await apiControl('set_overrides', payload);
+  await refresh();
+}
+
 async function refresh() {
   const r = await fetch('/api/state');
   const s = await r.json();
 
   const open = Object.values(s.open_positions || {});
   const closed = (s.closed_trades || []).slice(-25).reverse();
+  const control = s.control || { paused: false, overrides: {} };
 
   document.getElementById('balance').textContent = Number(s.balance || 0).toFixed(2);
   document.getElementById('openCount').textContent = open.length;
   document.getElementById('closedCount').textContent = closed.length;
 
+  const statusEl = document.getElementById('botStatus');
+  statusEl.textContent = control.paused ? 'Status: paused (new entries blocked)' : 'Status: running';
+  statusEl.classList.toggle('paused', !!control.paused);
+
+  const overrides = control.overrides || {};
+  if (overrides.min_confidence !== undefined) {
+    document.getElementById('cfgMinConfidence').value = overrides.min_confidence;
+  }
+  if (overrides.correlation_threshold !== undefined) {
+    document.getElementById('cfgCorrThreshold').value = overrides.correlation_threshold;
+  }
+  if (overrides.max_correlated_positions !== undefined) {
+    document.getElementById('cfgCorrCount').value = overrides.max_correlated_positions;
+  }
+
   document.getElementById('openRows').innerHTML = open.map(p =>
-    `<tr><td>${p.symbol}</td><td>${p.direction}</td><td>${Number(p.entry_price||0).toFixed(4)}</td><td>${Number(p.stop_loss||0).toFixed(4)}</td><td>${Number(p.quantity||0).toFixed(4)}</td><td class="${pnlClass(p.pnl)}">${Number(p.pnl||0).toFixed(2)}</td></tr>`
+    `<tr><td>${p.symbol}</td><td>${p.direction}</td><td>${Number(p.entry_price||0).toFixed(4)}</td><td>${Number(p.stop_loss||0).toFixed(4)}</td><td>${Number(p.quantity||0).toFixed(4)}</td><td class="${pnlClass(p.pnl)}">${Number(p.pnl||0).toFixed(2)}</td><td><span class="inline-actions"><button class="small-btn warn" onclick="closeSymbol('${p.symbol}')">Close</button></span></td></tr>`
   ).join('');
 
   document.getElementById('closedRows').innerHTML = closed.map(t =>

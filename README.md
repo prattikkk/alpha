@@ -70,7 +70,7 @@ Binance MAINNET (market data, read-only)
 - **SL**: 1.5× ATR below/above entry
 - **TP1**: 2.5× ATR — 50% partial exit
 - **TP2**: 4.0× ATR — remaining 50%
-- **Trailing stop**: After TP1 hit, SL moves to breakeven
+- **Trailing stop**: After TP1 hit, live mode can use exchange-side trailing stop orders
 - **Max positions**: 4 concurrent
 - **Max portfolio risk**: 6% total
 - **Correlation guard**: skips new entries when highly correlated exposure is already open
@@ -126,6 +126,11 @@ python dashboard.py
 # Open http://127.0.0.1:8080
 ```
 
+Dashboard controls:
+- Pause/resume new entries
+- Close a single position or close all positions
+- Apply runtime overrides (min confidence and correlation constraints)
+
 ---
 
 ## File Structure
@@ -179,6 +184,7 @@ alphabot/
 | `AI_SENTIMENT_ENABLED` | `false` | Enable optional AI confidence adjustment |
 | `LOG_FORMAT` | `text` | `text` or `json` structured logs |
 | `CLOSE_ON_SHUTDOWN` | `false` | Force-close open positions during shutdown |
+| `USE_WEBSOCKET_DATA` | `true` | Enable websocket ticker cache for faster live prices |
 | `DRY_RUN` | `false` | Skip order execution |
 
 ---

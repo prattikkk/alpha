@@ -77,7 +77,9 @@ class PositionMonitor:
 
             # Trailing stop: once TP1 hit, move SL to breakeven
             if tp1_hit:
-                self._update_exchange_trailing_stop(symbol, pos, price)
+                if pos.get("exchange_trailing_active"):
+                    return
+                self._update_client_trailing_stop(symbol, pos, price)
 
         else:  # SHORT
             if price >= sl:
@@ -95,12 +97,14 @@ class PositionMonitor:
                 return
 
             if tp1_hit:
-                self._update_exchange_trailing_stop(symbol, pos, price)
+                if pos.get("exchange_trailing_active"):
+                    return
+                self._update_client_trailing_stop(symbol, pos, price)
 
     def _close_sl(self, symbol: str, price: float, order_ids: dict):
         log.warning(f"⛔ SL triggered [{symbol}] @ {price:.4f}")
         # Cancel remaining TP orders on testnet
-        for key in ["tp1", "tp2"]:
+        for key in ["tp1", "tp2", "trail"]:
             oid = order_ids.get(key)
             if oid:
                 self.executor.cancel_order(symbol, oid)
@@ -139,18 +143,62 @@ class PositionMonitor:
             live_pos["highest_price"] = float(price)
         else:
             live_pos["lowest_price"] = float(price)
+
+        self._activate_exchange_trailing_stop(symbol, live_pos, float(price))
+
         self.portfolio._save()
         log.info(f"🎯 TP1 [{symbol}] @ {price:.4f} | pnl=${pnl:+.2f} | SL re-armed @ {new_sl:.4f}")
 
     def _close_tp2(self, symbol: str, price: float, order_ids: dict):
         log.info(f"🏁 TP2 hit [{symbol}] @ {price:.4f}")
-        # Cancel SL on testnet
-        sl_id = order_ids.get("sl")
-        if sl_id:
-            self.executor.cancel_order(symbol, sl_id)
+        # Cancel protection orders on testnet
+        for key in ["sl", "trail"]:
+            oid = order_ids.get(key)
+            if oid:
+                self.executor.cancel_order(symbol, oid)
         self.portfolio.close_position(symbol, price, reason="TP2_HIT")
 
-    def _update_exchange_trailing_stop(self, symbol: str, pos: dict, price: float):
+    def _activate_exchange_trailing_stop(self, symbol: str, pos: dict, price: float) -> None:
+        if self._trailing_pct <= 0:
+            return
+        if pos.get("exchange_trailing_active"):
+            return
+        if not self.executor.has_credentials:
+            return
+
+        qty = float(pos.get("quantity", 0.0))
+        if qty <= 0:
+            return
+
+        order_ids = pos.setdefault("order_ids", {})
+        current_sl_id = order_ids.get("sl")
+        callback_rate_pct = self._trailing_pct * 100.0
+
+        trail_id = self.executor.place_trailing_stop(
+            symbol=symbol,
+            direction=pos.get("direction", Direction.LONG.value),
+            quantity=qty,
+            callback_rate_pct=callback_rate_pct,
+            activation_price=price,
+        )
+        if not trail_id:
+            log.warning("[%s] exchange trailing stop unavailable; using client-side trailing", symbol)
+            return
+
+        if current_sl_id and current_sl_id != "DRY_RUN":
+            self.executor.cancel_order(symbol, current_sl_id)
+
+        order_ids["trail"] = trail_id
+        order_ids["sl"] = None
+        pos["exchange_trailing_active"] = True
+        self.portfolio._save()
+        log.info(
+            "[%s] exchange trailing stop activated | callback=%.2f%%",
+            symbol,
+            callback_rate_pct,
+        )
+
+    def _update_client_trailing_stop(self, symbol: str, pos: dict, price: float):
         if self._trailing_pct <= 0:
             return
 
@@ -199,7 +247,7 @@ class PositionMonitor:
 
     def _emergency_flatten(self, symbol: str, pos: dict, price: float, reason: str):
         order_ids = pos.get("order_ids", {})
-        for key in ["sl", "tp1", "tp2"]:
+        for key in ["sl", "tp1", "tp2", "trail"]:
             oid = order_ids.get(key)
             if oid:
                 self.executor.cancel_order(symbol, oid)

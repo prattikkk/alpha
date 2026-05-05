@@ -14,6 +14,11 @@ import numpy as np
 import pandas as pd
 import requests
 
+try:
+    from binance import ThreadedWebsocketManager
+except Exception:  # pragma: no cover - optional dependency at runtime
+    ThreadedWebsocketManager = None
+
 from config import CONFIG
 from core.resilience import CircuitBreaker, TokenBucketLimiter, retry_delay_seconds
 from utils.logger import get_logger
@@ -63,6 +68,13 @@ class DataFetcher:
         self._backoff_cap = api_cfg.backoff_cap_seconds
         self._max_concurrent = max(1, int(api_cfg.max_concurrent_requests))
 
+        self._ws_enabled = bool(CONFIG.trading.use_websocket_data)
+        self._ws_manager = None
+        self._ws_started = False
+        self._ws_symbol_sockets: set[str] = set()
+        self._ws_prices: dict[str, tuple[float, float]] = {}
+        self._ws_ttl_seconds = 5.0
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -101,6 +113,65 @@ class DataFetcher:
         """Fetch primary + higher timeframes for confluence."""
         return self.get_multi_tf_bulk([symbol]).get(symbol, {})
 
+    def start_price_stream(self, symbols: list[str]) -> bool:
+        """Start websocket ticker streams for low-latency prices."""
+        if not self._ws_enabled or ThreadedWebsocketManager is None:
+            return False
+
+        wanted = {s.upper() for s in symbols if s}
+        if not wanted:
+            return False
+
+        if not self._ws_started:
+            try:
+                self._ws_manager = ThreadedWebsocketManager()
+                self._ws_manager.start()
+                self._ws_started = True
+            except Exception as e:
+                log.debug("Websocket manager start failed: %s", e)
+                self._ws_manager = None
+                self._ws_started = False
+                return False
+
+        added = False
+        for symbol in sorted(wanted - self._ws_symbol_sockets):
+            try:
+                self._ws_manager.start_symbol_ticker_socket(
+                    callback=self._on_ticker_message,
+                    symbol=symbol.lower(),
+                )
+                self._ws_symbol_sockets.add(symbol)
+                added = True
+            except Exception as e:
+                log.debug("Failed subscribing websocket ticker for %s: %s", symbol, e)
+
+        return added or bool(self._ws_symbol_sockets)
+
+    def stop_price_stream(self) -> None:
+        if not self._ws_started:
+            return
+        try:
+            if self._ws_manager is not None:
+                self._ws_manager.stop()
+        except Exception as e:
+            log.debug("Websocket manager stop failed: %s", e)
+        finally:
+            self._ws_manager = None
+            self._ws_started = False
+            self._ws_symbol_sockets.clear()
+
+    def _on_ticker_message(self, msg: dict) -> None:
+        if not isinstance(msg, dict):
+            return
+        symbol = str(msg.get("s", "")).upper()
+        if not symbol:
+            return
+        try:
+            price = float(msg.get("c"))
+        except Exception:
+            return
+        self._ws_prices[symbol] = (time.time(), price)
+
     def get_multi_tf_bulk(self, symbols: list[str]) -> dict[str, dict[str, pd.DataFrame]]:
         """Parallel fetch primary + HTFs for many symbols using asyncio + aiohttp."""
         cfg = CONFIG.strategy
@@ -128,6 +199,10 @@ class DataFetcher:
 
     def get_current_price(self, symbol: str) -> Optional[float]:
         """Fast ticker price from mainnet."""
+        ws_price = self._ws_prices.get(symbol.upper())
+        if ws_price and time.time() - ws_price[0] <= self._ws_ttl_seconds:
+            return ws_price[1]
+
         payload = self._request_json_sync(
             url=f"{MAINNET_BASE}/fapi/v1/ticker/price",
             params={"symbol": symbol},
@@ -253,6 +328,49 @@ class DataFetcher:
         except Exception as e:
             log.debug("Correlation calc failed [%s/%s]: %s", symbol_a, symbol_b, e)
             return None
+
+    def get_close_correlation_matrix(
+        self,
+        symbols: list[str],
+        interval: str,
+        lookback: int,
+    ) -> dict[tuple[str, str], float]:
+        """Return pairwise close-return correlations for provided symbols."""
+        unique = list(dict.fromkeys([s.upper() for s in symbols if s]))
+        if len(unique) < 2:
+            return {}
+
+        look = max(50, int(lookback))
+        series_by_symbol: dict[str, pd.Series] = {}
+
+        for symbol in unique:
+            df = self.get_ohlcv(symbol, interval=interval, limit=look + 5)
+            if df is None or df.empty:
+                continue
+            returns = df["close"].pct_change().dropna().tail(look)
+            if len(returns) >= 30:
+                series_by_symbol[symbol] = returns
+
+        if len(series_by_symbol) < 2:
+            return {}
+
+        joined = pd.DataFrame(series_by_symbol).dropna()
+        if len(joined) < 30:
+            return {}
+
+        corr = joined.corr()
+        out: dict[tuple[str, str], float] = {}
+
+        for a in corr.columns:
+            for b in corr.columns:
+                if a == b:
+                    continue
+                val = corr.at[a, b]
+                if pd.isna(val):
+                    continue
+                out[(str(a), str(b))] = float(val)
+
+        return out
 
     # ------------------------------------------------------------------
     # Internal helpers

@@ -16,6 +16,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import signal as os_signal
 import time
@@ -24,6 +25,7 @@ from typing import Iterable
 
 from config import CONFIG
 from core.ai_sentiment import AISentimentEngine
+from core.control_plane import drain_commands, get_control_state
 from core.exchange_factory import create_data_fetcher, create_executor
 from core.portfolio import Portfolio
 from core.position_monitor import PositionMonitor
@@ -74,9 +76,13 @@ class TradingBot:
 
         self.symbols = list(symbols)
         self.strategy_name = strategy_name
-        self.strategy = STRATEGY_MAP[strategy_name]()
+        self.strategy_cls = STRATEGY_MAP[strategy_name]
+        self.strategy = self.strategy_cls()
         self.dry_run = dry_run
         self.exchange = CONFIG.exchange.name
+        self._symbol_order = {symbol: idx for idx, symbol in enumerate(self.symbols)}
+        self._runtime_paused = False
+        self._runtime_overrides: dict[str, float | int] = {}
 
         self.fetcher = create_data_fetcher(self.exchange)
         self.executor = create_executor(self.exchange)
@@ -84,6 +90,9 @@ class TradingBot:
         self.risk = RiskManager(self.portfolio)
         self.monitor = PositionMonitor(self.portfolio, self.executor, self.fetcher)
         self.ai_sentiment = AISentimentEngine()
+
+        self.fetcher.start_price_stream(self.symbols)
+        self._refresh_runtime_state()
 
         self._sync_positions_from_exchange()
 
@@ -236,9 +245,108 @@ class TradingBot:
             log.warning("Startup sync: aligned local position %s with exchange state", symbol)
         return changed
 
+    def _refresh_runtime_state(self) -> None:
+        state = get_control_state()
+        self._runtime_paused = bool(state.get("paused", False))
+
+        overrides = state.get("overrides", {})
+        parsed: dict[str, float | int] = {}
+        if isinstance(overrides, dict):
+            min_conf = overrides.get("min_confidence")
+            if min_conf is not None:
+                try:
+                    parsed["min_confidence"] = max(0.0, min(1.0, float(min_conf)))
+                except Exception:
+                    pass
+
+            corr_threshold = overrides.get("correlation_threshold")
+            if corr_threshold is not None:
+                try:
+                    parsed["correlation_threshold"] = max(0.0, min(1.0, float(corr_threshold)))
+                except Exception:
+                    pass
+
+            max_corr = overrides.get("max_correlated_positions")
+            if max_corr is not None:
+                try:
+                    parsed["max_correlated_positions"] = max(1, int(max_corr))
+                except Exception:
+                    pass
+
+        self._runtime_overrides = parsed
+
+    def _effective_min_confidence(self) -> float:
+        override = self._runtime_overrides.get("min_confidence")
+        if override is None:
+            return float(CONFIG.strategy.min_confidence)
+        return float(override)
+
+    def _effective_correlation_threshold(self) -> float:
+        override = self._runtime_overrides.get("correlation_threshold")
+        if override is None:
+            return float(CONFIG.risk.correlation_threshold)
+        return float(override)
+
+    def _effective_max_correlated_positions(self) -> int:
+        override = self._runtime_overrides.get("max_correlated_positions")
+        if override is None:
+            return max(1, int(CONFIG.risk.max_correlated_positions))
+        return max(1, int(override))
+
+    def _process_runtime_commands(self) -> None:
+        commands = drain_commands()
+        if not commands:
+            return
+
+        for command in commands:
+            action = str(command.get("action", "")).strip().lower()
+            payload = command.get("payload", {})
+            if not isinstance(payload, dict):
+                payload = {}
+
+            if action == "close_symbol":
+                symbol = str(payload.get("symbol", "")).strip().upper()
+                if symbol:
+                    self._force_close_symbol(symbol, reason="DASHBOARD_CLOSE")
+                continue
+
+            if action == "close_all":
+                symbols = sorted(self.portfolio.open_positions.keys())
+                for symbol in symbols:
+                    self._force_close_symbol(symbol, reason="DASHBOARD_CLOSE_ALL")
+                continue
+
+            log.warning("Ignoring unsupported runtime command: %s", action)
+
+    def _force_close_symbol(self, symbol: str, reason: str) -> None:
+        pos = self.portfolio.open_positions.get(symbol)
+        if not pos:
+            return
+
+        self._cancel_protective_orders(symbol, pos)
+
+        qty = float(pos.get("quantity", 0.0))
+        if qty > 0 and not self.dry_run:
+            self.executor.close_position_market(symbol, pos.get("direction", "LONG"), qty)
+
+        exit_price = self.fetcher.get_current_price(symbol)
+        if exit_price is None:
+            exit_price = float(pos.get("entry_price", 0.0))
+        self.portfolio.close_position(symbol, float(exit_price), reason=reason)
+        notify_event("Dashboard Action", f"{reason}: closed {symbol}")
+
+    def _cancel_protective_orders(self, symbol: str, pos: dict) -> None:
+        order_ids = pos.get("order_ids", {})
+        for key in ["sl", "tp1", "tp2", "trail"]:
+            oid = order_ids.get(key)
+            if oid and oid != "DRY_RUN":
+                self.executor.cancel_order(symbol, oid)
+
     def run_cycle(self) -> None:
         # First manage any existing open positions.
         self.monitor.check_all()
+        self._process_runtime_commands()
+        self._refresh_runtime_state()
 
         primary_tf = CONFIG.strategy.primary_tf
         htf_1 = CONFIG.strategy.htf_1
@@ -254,6 +362,10 @@ class TradingBot:
                 cycle_stats.get("return_pct", 0.0),
                 daily_loss_limit_pct,
             )
+
+        if self._runtime_paused:
+            halt_new_entries = True
+            log.warning("Runtime pause is active; skipping new entries this cycle")
 
         eligible_symbols: list[str] = []
 
@@ -282,34 +394,54 @@ class TradingBot:
             eligible_symbols.append(symbol)
 
         multi_tf_by_symbol = self.fetcher.get_multi_tf_bulk(eligible_symbols) if eligible_symbols else {}
+        min_confidence = self._effective_min_confidence()
 
-        for symbol in eligible_symbols:
-            multi_tf = multi_tf_by_symbol.get(symbol, {})
+        signal_candidates: list[dict] = []
+        if eligible_symbols:
+            max_workers = min(
+                len(eligible_symbols),
+                max(1, int(CONFIG.api.max_concurrent_requests)),
+            )
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {
+                    pool.submit(
+                        self._generate_signal_candidate,
+                        symbol,
+                        multi_tf_by_symbol.get(symbol, {}),
+                        primary_tf,
+                        htf_1,
+                        htf_2,
+                        min_confidence,
+                    ): symbol
+                    for symbol in eligible_symbols
+                }
 
-            df = multi_tf.get(primary_tf)
-            if df is None or len(df) < 120:
-                log.warning("[%s] not enough %s data to evaluate", symbol, primary_tf)
-                continue
+                for future in as_completed(futures):
+                    symbol = futures[future]
+                    try:
+                        candidate = future.result()
+                    except Exception as e:
+                        log.error("[%s] signal generation failed: %s", symbol, e)
+                        continue
+                    if candidate is not None:
+                        signal_candidates.append(candidate)
 
-            signal = self.strategy.generate(
-                symbol=symbol,
-                df=df,
-                htf_df=multi_tf.get(htf_1),
-                htf_df2=multi_tf.get(htf_2),
+        signal_candidates.sort(key=lambda item: self._symbol_order.get(item["symbol"], 10**9))
+
+        corr_matrix: dict[tuple[str, str], float] = {}
+        if bool(CONFIG.risk.correlation_management_enabled) and signal_candidates:
+            corr_symbols = [c["symbol"] for c in signal_candidates]
+            corr_symbols.extend(self.portfolio.open_positions.keys())
+            corr_matrix = self.fetcher.get_close_correlation_matrix(
+                corr_symbols,
+                primary_tf,
+                int(CONFIG.risk.correlation_lookback),
             )
 
-            if signal is None:
-                continue
-
-            if not signal.is_valid:
-                log.info(
-                    "[%s] signal rejected | conf=%.2f | rr=%.2f | reason=%s",
-                    symbol,
-                    signal.confidence,
-                    signal.risk_reward,
-                    signal.reason,
-                )
-                continue
+        for candidate in signal_candidates:
+            symbol = candidate["symbol"]
+            signal = candidate["signal"]
+            df = candidate["df"]
 
             funding_threshold = CONFIG.trading.max_unfavorable_funding_rate
             if funding_threshold > 0:
@@ -332,7 +464,7 @@ class TradingBot:
                         )
                         continue
 
-            if self._is_correlation_blocked(symbol, primary_tf):
+            if self._is_correlation_blocked(symbol, primary_tf, corr_matrix):
                 continue
 
             if self.ai_sentiment.enabled:
@@ -342,7 +474,7 @@ class TradingBot:
                 if ai_adj != 0:
                     signal.confidence = max(0.0, min(1.0, signal.confidence + ai_adj))
                     signal.reason = f"{signal.reason} | ai_adj={ai_adj:+.2f}"
-                    if not signal.is_valid:
+                    if not self._signal_is_tradeable(signal, min_confidence):
                         log.info("[%s] AI sentiment reduced confidence below threshold", symbol)
                         continue
 
@@ -396,7 +528,63 @@ class TradingBot:
         )
         notify_stats(stats)
 
-    def _is_correlation_blocked(self, candidate_symbol: str, interval: str) -> bool:
+    def _generate_signal_candidate(
+        self,
+        symbol: str,
+        multi_tf: dict,
+        primary_tf: str,
+        htf_1: str,
+        htf_2: str,
+        min_confidence: float,
+    ) -> dict | None:
+        df = multi_tf.get(primary_tf)
+        if df is None or len(df) < 120:
+            log.warning("[%s] not enough %s data to evaluate", symbol, primary_tf)
+            return None
+
+        strategy = self.strategy_cls()
+        signal = strategy.generate(
+            symbol=symbol,
+            df=df,
+            htf_df=multi_tf.get(htf_1),
+            htf_df2=multi_tf.get(htf_2),
+        )
+        if signal is None:
+            return None
+
+        if not self._signal_is_tradeable(signal, min_confidence):
+            log.info(
+                "[%s] signal rejected | conf=%.2f | rr=%.2f | reason=%s",
+                symbol,
+                signal.confidence,
+                signal.risk_reward,
+                signal.reason,
+            )
+            return None
+
+        return {
+            "symbol": symbol,
+            "signal": signal,
+            "df": df,
+        }
+
+    @staticmethod
+    def _signal_is_tradeable(signal, min_confidence: float) -> bool:
+        return (
+            signal.direction != Direction.FLAT
+            and signal.confidence >= float(min_confidence)
+            and signal.risk_reward >= CONFIG.risk.min_rr_ratio
+            and signal.stop_loss > 0
+            and signal.take_profit_1 > 0
+            and signal.take_profit_2 > 0
+        )
+
+    def _is_correlation_blocked(
+        self,
+        candidate_symbol: str,
+        interval: str,
+        corr_matrix: dict[tuple[str, str], float] | None = None,
+    ) -> bool:
         if not bool(CONFIG.risk.correlation_management_enabled):
             return False
 
@@ -404,13 +592,21 @@ class TradingBot:
         if not open_symbols:
             return False
 
-        threshold = float(CONFIG.risk.correlation_threshold)
+        threshold = float(self._effective_correlation_threshold())
         lookback = int(CONFIG.risk.correlation_lookback)
-        max_correlated = max(1, int(CONFIG.risk.max_correlated_positions))
+        max_correlated = self._effective_max_correlated_positions()
 
         correlated = 0
         for open_symbol in open_symbols:
-            corr = self.fetcher.get_close_correlation(candidate_symbol, open_symbol, interval, lookback)
+            corr = None
+            if corr_matrix:
+                corr = corr_matrix.get((candidate_symbol, open_symbol))
+                if corr is None:
+                    corr = corr_matrix.get((open_symbol, candidate_symbol))
+
+            if corr is None:
+                corr = self.fetcher.get_close_correlation(candidate_symbol, open_symbol, interval, lookback)
+
             if corr is None:
                 continue
             if abs(corr) >= threshold:
@@ -448,17 +644,14 @@ class TradingBot:
     def shutdown(self, close_positions: bool, reason: str = "shutdown") -> None:
         positions = dict(self.portfolio.open_positions)
         if not positions:
+            self.fetcher.stop_price_stream()
             notify_event("AlphaBot Shutdown", f"No open positions. Reason: {reason}")
             return
 
         closed_count = 0
         for symbol, pos in positions.items():
             if close_positions and not self.dry_run:
-                order_ids = pos.get("order_ids", {})
-                for key in ["sl", "tp1", "tp2"]:
-                    oid = order_ids.get(key)
-                    if oid and oid != "DRY_RUN":
-                        self.executor.cancel_order(symbol, oid)
+                self._cancel_protective_orders(symbol, pos)
 
                 qty = float(pos.get("quantity", 0.0))
                 if qty > 0:
@@ -468,6 +661,7 @@ class TradingBot:
                 closed_count += 1
 
         self.portfolio._save()
+        self.fetcher.stop_price_stream()
         notify_event(
             "AlphaBot Shutdown",
             (
