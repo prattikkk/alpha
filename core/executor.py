@@ -85,6 +85,17 @@ class TestnetExecutor:
             log.error(f"Entry order failed for {pos.symbol}")
             return {}
 
+        use_exchange_protection = bool(getattr(CONFIG.trading, "exchange_protective_orders", False))
+        if not use_exchange_protection:
+            ids = {
+                "entry": entry_order.get("orderId"),
+                "sl": None,
+                "tp1": None,
+                "tp2": None,
+            }
+            log.info("Orders placed [%s] with client-side protection only: %s", pos.symbol, ids)
+            return ids
+
         qty_half = self._round_qty(pos.quantity / 2, pos.symbol)
         qty_rest = self._round_qty(pos.quantity - qty_half, pos.symbol)
 
@@ -116,16 +127,17 @@ class TestnetExecutor:
         )
 
         if not sl_order or not tp1_order or not tp2_order:
-            log.error(
-                f"[{pos.symbol}] protective orders incomplete (SL/TP). Attempting emergency close of entry."
+            log.warning(
+                "[%s] protective orders incomplete (SL/TP); using client-side protection fallback",
+                pos.symbol,
             )
-            self._place_order(
-                symbol=pos.symbol,
-                side=close_side,
-                order_type="MARKET",
-                quantity=pos.quantity,
-            )
-            return {}
+            ids = {
+                "entry": entry_order.get("orderId"),
+                "sl": None,
+                "tp1": None,
+                "tp2": None,
+            }
+            return ids
 
         ids = {
             "entry": entry_order.get("orderId"),
@@ -133,11 +145,15 @@ class TestnetExecutor:
             "tp1":   self._extract_protective_id(tp1_order),
             "tp2":   self._extract_protective_id(tp2_order),
         }
-        log.info(f"✅ Orders placed [{pos.symbol}]: {ids}")
+        log.info("Orders placed [%s]: %s", pos.symbol, ids)
         return ids
 
     def cancel_order(self, symbol: str, order_id: int | str) -> bool:
         order_ref = str(order_id)
+        if order_ref.startswith("pending:"):
+            # Async-accepted algo orders may not return immediate server IDs.
+            return True
+
         if order_ref.startswith("algo:"):
             algo_id = order_ref.split(":", 1)[1]
             return self._cancel_um_algo_order(algo_id)
@@ -164,6 +180,37 @@ class TestnetExecutor:
 
     def get_account(self) -> Optional[dict]:
         return self._signed_get("/fapi/v2/account", {})
+
+    def get_quote_asset_balance(self, quote_asset: str | None = None) -> Optional[dict]:
+        """Return wallet and available balance for the quote asset (default USDT)."""
+        account = self.get_account()
+        if not isinstance(account, dict):
+            return None
+
+        asset = (quote_asset or CONFIG.binance.quote_asset or "USDT").upper()
+        assets = account.get("assets", [])
+        if isinstance(assets, list):
+            for row in assets:
+                if str(row.get("asset", "")).upper() != asset:
+                    continue
+                wallet = self._to_float(row.get("walletBalance", 0.0))
+                available = self._to_float(row.get("availableBalance", wallet))
+                return {
+                    "asset": asset,
+                    "wallet_balance": wallet,
+                    "available_balance": available,
+                }
+
+        # Fallback when per-asset rows are absent.
+        wallet = self._to_float(account.get("totalWalletBalance", 0.0))
+        available = self._to_float(account.get("availableBalance", wallet))
+        if wallet > 0 or available > 0:
+            return {
+                "asset": asset,
+                "wallet_balance": wallet,
+                "available_balance": available,
+            }
+        return None
 
     def get_order_status(self, symbol: str, order_id: int) -> Optional[dict]:
         return self._signed_get("/fapi/v1/order", {"symbol": symbol, "orderId": order_id})
@@ -314,7 +361,7 @@ class TestnetExecutor:
 
         resp = self._signed_post("/fapi/v1/order", params)
         if resp:
-            log.debug(f"  Order: {order_type} {side} {symbol} qty={quantity} → id={resp.get('orderId')}")
+            log.debug(f"  Order: {order_type} {side} {symbol} qty={quantity} -> id={resp.get('orderId')}")
         return resp
 
     def _set_leverage(self, symbol: str, leverage: int):
@@ -333,6 +380,8 @@ class TestnetExecutor:
         if qty <= 0:
             return None
 
+        client_id = f"ab_{int(time.time() * 1000)}"
+
         params = {
             "algoType": "CONDITIONAL",
             "symbol": symbol,
@@ -344,8 +393,11 @@ class TestnetExecutor:
             "priceProtect": "false",
             "reduceOnly": "true",
             "newOrderRespType": "ACK",
+            "clientAlgoId": client_id,
         }
         resp = self._signed_post_papi("/papi/v1/um/algo/order", params)
+        if resp and resp.get("accepted") and "client_id" not in resp:
+            resp["client_id"] = client_id
         if resp:
             return resp
 
@@ -359,8 +411,12 @@ class TestnetExecutor:
             "workingType": "CONTRACT_PRICE",
             "priceProtect": "false",
             "reduceOnly": "true",
+            "newClientStrategyId": client_id,
         }
-        return self._signed_post_papi("/papi/v1/um/conditional/order", fallback)
+        fallback_resp = self._signed_post_papi("/papi/v1/um/conditional/order", fallback)
+        if fallback_resp and fallback_resp.get("accepted") and "client_id" not in fallback_resp:
+            fallback_resp["client_id"] = client_id
+        return fallback_resp
 
     def _cancel_um_algo_order(self, algo_id: str) -> bool:
         resp = self._signed_delete_papi("/papi/v1/um/algo/order", {"algoId": algo_id})
@@ -380,6 +436,8 @@ class TestnetExecutor:
     def _extract_protective_id(order: Optional[dict]) -> Optional[str | int]:
         if not order:
             return None
+        if order.get("client_id"):
+            return f"pending:{order['client_id']}"
         if "algoId" in order:
             return f"algo:{order['algoId']}"
         if "strategyId" in order:
@@ -440,11 +498,16 @@ class TestnetExecutor:
                 else:
                     resp = self.session.get(f"{url}?{query}", timeout=10)
 
-                if resp.status_code in (200, 201):
+                if resp.status_code in (200, 201, 202):
                     self._circuit_breaker.record_success(endpoint_key)
                     try:
-                        return resp.json()
+                        data = resp.json()
+                        if isinstance(data, dict):
+                            return data
+                        return {"data": data}
                     except Exception:
+                        if resp.status_code == 202:
+                            return {"accepted": True}
                         return {}
 
                 self._circuit_breaker.record_failure(endpoint_key)
@@ -458,7 +521,7 @@ class TestnetExecutor:
 
                 text = resp.text[:200].replace("\n", " ") if resp.text else ""
                 log.error(
-                    f"API {method} {base_url}{path} → {resp.status_code}: {text}"
+                    f"API {method} {base_url}{path} -> {resp.status_code}: {text}"
                 )
                 return None
             except Exception as e:

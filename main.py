@@ -95,6 +95,7 @@ class TradingBot:
         self._refresh_runtime_state()
 
         self._sync_positions_from_exchange()
+        self._sync_balance_from_exchange()
 
         log.info(
             "Bot initialized | exchange=%s | strategy=%s | dry_run=%s | symbols=%s",
@@ -244,6 +245,37 @@ class TradingBot:
         if changed:
             log.warning("Startup sync: aligned local position %s with exchange state", symbol)
         return changed
+
+    def _sync_balance_from_exchange(self) -> None:
+        if self.dry_run:
+            return
+
+        quote_asset = str(CONFIG.binance.quote_asset or "USDT").upper()
+        balance_info = self.executor.get_quote_asset_balance(quote_asset)
+        if not balance_info:
+            log.warning("Startup balance sync: exchange balance unavailable")
+            return
+
+        wallet_balance = float(balance_info.get("wallet_balance", 0.0))
+        available_balance = float(balance_info.get("available_balance", wallet_balance))
+        sync_balance = available_balance if available_balance > 0 else wallet_balance
+        if sync_balance <= 0:
+            log.warning(
+                "Startup balance sync: non-positive balance for %s (wallet=%.4f available=%.4f)",
+                quote_asset,
+                wallet_balance,
+                available_balance,
+            )
+            return
+
+        reset_total = len(self.portfolio.closed_trades) == 0
+        self.portfolio.sync_exchange_balance(sync_balance, reset_total_capital=reset_total)
+        log.info(
+            "Startup balance sync complete | asset=%s wallet=%.2f available=%.2f",
+            quote_asset,
+            wallet_balance,
+            available_balance,
+        )
 
     def _refresh_runtime_state(self) -> None:
         state = get_control_state()

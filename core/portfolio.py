@@ -60,6 +60,28 @@ class Portfolio:
         )
         return max(0.0, self._balance - reserved)
 
+    def sync_exchange_balance(self, new_balance: float, reset_total_capital: bool = False) -> None:
+        """Align runtime portfolio cash with exchange-reported wallet/available balance."""
+        try:
+            balance = float(new_balance)
+        except Exception:
+            return
+
+        if balance <= 0:
+            return
+
+        old_balance = self._balance
+        self._balance = balance
+        if reset_total_capital:
+            self.total_capital = balance
+
+        self._save()
+        log.info(
+            "Synced portfolio balance from exchange | old=$%.2f new=$%.2f",
+            old_balance,
+            self._balance,
+        )
+
     # ------------------------------------------------------------------ #
     # Position management
     # ------------------------------------------------------------------ #

@@ -150,6 +150,7 @@ class _Config:
             analysis_interval=int(os.getenv("ANALYSIS_INTERVAL", "300")),
             execution_timeframe=os.getenv("EXECUTION_TIMEFRAME", "15m"),
             use_websocket_data=_env_bool("USE_WEBSOCKET_DATA", True),
+            exchange_protective_orders=_env_bool("EXCHANGE_PROTECTIVE_ORDERS", False),
             min_volume_24h=float(os.getenv("MIN_VOLUME_24H", "5000000")),
             max_unfavorable_funding_rate=float(os.getenv("MAX_UNFAVORABLE_FUNDING_RATE", "0.0005")),
             max_hold_hours=float(os.getenv("MAX_HOLD_HOURS", "8")),
