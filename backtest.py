@@ -3,7 +3,7 @@ backtest.py — Offline backtester using mainnet historical data.
 Run this BEFORE going live to validate the strategy on your chosen symbols.
 
 Usage:
-    python backtest.py --symbol BTCUSDT --tf 15m --days 90
+    python backtest.py --symbol BTCUSDT --tf 4h --days 180 --strategy adx_trend
 """
 from __future__ import annotations
 import sys
@@ -17,6 +17,7 @@ import pandas as pd
 import numpy as np
 from config import CONFIG
 from core.signal import Direction
+from strategies.adx_trend import ADXTrendStrategy
 from strategies.ensemble import EnsembleStrategy
 from strategies.supertrend_rsi import SuperTrendRSIStrategy
 from strategies.ema_adx_volume import EMAAdxVolumeStrategy
@@ -26,6 +27,7 @@ from utils.logger import get_logger
 log = get_logger("Backtest")
 
 STRATEGY_MAP = {
+    "adx_trend":         ADXTrendStrategy,
     "ensemble":          EnsembleStrategy,
     "supertrend_rsi":    SuperTrendRSIStrategy,
     "ema_adx_volume":    EMAAdxVolumeStrategy,
@@ -48,7 +50,7 @@ RESAMPLE_RULES = {
     "4h": "4h",
     "6h": "6h",
     "12h": "12h",
-    "1d": "1d",
+    "1d": "1D",
 }
 
 
@@ -122,7 +124,7 @@ class Backtest:
         self.symbol          = symbol
         self.interval        = interval
         self.days            = days
-        self.strategy        = STRATEGY_MAP.get(strategy_name, EnsembleStrategy)()
+        self.strategy        = STRATEGY_MAP.get(strategy_name, ADXTrendStrategy)()
         self.capital         = initial_capital
         self.risk_per_trade  = risk_per_trade
         self.leverage        = leverage
@@ -660,9 +662,9 @@ class Backtest:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AlphaBot Backtester")
     parser.add_argument("--symbol",   default="BTCUSDT")
-    parser.add_argument("--tf",       default="15m")
+    parser.add_argument("--tf",       default="4h")
     parser.add_argument("--days",     type=int, default=60)
-    parser.add_argument("--strategy", default="ensemble",
+    parser.add_argument("--strategy", default="adx_trend",
                         choices=list(STRATEGY_MAP.keys()))
     parser.add_argument("--capital",  type=float, default=1000.0)
     parser.add_argument(

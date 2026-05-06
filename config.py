@@ -93,10 +93,10 @@ class _Config:
         )
 
         self.strategy = _Section(
-            primary_tf=os.getenv("PRIMARY_TF", "15m"),
-            htf_1=os.getenv("HTF_1", "1h"),
-            htf_2=os.getenv("HTF_2", "4h"),
-            min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.70")),
+            primary_tf=os.getenv("PRIMARY_TF", "4h"),
+            htf_1=os.getenv("HTF_1", "12h"),
+            htf_2=os.getenv("HTF_2", "1d"),
+            min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.60")),
             use_support_resistance=_env_bool("USE_SUPPORT_RESISTANCE", True),
             ensemble_min_signals=int(os.getenv("ENSEMBLE_MIN_SIGNALS", "2")),
             regime_adx_trending=float(os.getenv("REGIME_ADX_TRENDING", "23")),
@@ -115,6 +115,19 @@ class _Config:
             volume_ma_period=int(os.getenv("VOLUME_MA_PERIOD", "20")),
             volume_spike_ratio=float(os.getenv("VOLUME_SPIKE_RATIO", "1.5")),
             breakout_period=int(os.getenv("BREAKOUT_PERIOD", "20")),
+            adx_trend_fast_ema=int(os.getenv("ADX_TREND_FAST_EMA", "5")),
+            adx_trend_slow_ema=int(os.getenv("ADX_TREND_SLOW_EMA", "13")),
+            adx_trend_adx_period=int(os.getenv("ADX_TREND_ADX_PERIOD", "14")),
+            adx_trend_adx_min=float(os.getenv("ADX_TREND_ADX_MIN", "22")),
+            adx_trend_adx_rising_bars=int(os.getenv("ADX_TREND_ADX_RISING_BARS", "0")),
+            adx_trend_vol_min=float(os.getenv("ADX_TREND_VOL_MIN", "0.7")),
+            adx_trend_rsi_low=float(os.getenv("ADX_TREND_RSI_LOW", "25")),
+            adx_trend_rsi_high=float(os.getenv("ADX_TREND_RSI_HIGH", "75")),
+            adx_trend_body_atr_min=float(os.getenv("ADX_TREND_BODY_ATR_MIN", "0.2")),
+            adx_trend_sl_mult=float(os.getenv("ADX_TREND_SL_MULT", "2.0")),
+            adx_trend_tp1_mult=float(os.getenv("ADX_TREND_TP1_MULT", "2.0")),
+            adx_trend_tp2_mult=float(os.getenv("ADX_TREND_TP2_MULT", "5.0")),
+            adx_trend_htf_required=_env_bool("ADX_TREND_HTF_REQUIRED", False),
         )
 
         self.risk = _Section(

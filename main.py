@@ -31,6 +31,7 @@ from core.portfolio import Portfolio
 from core.position_monitor import PositionMonitor
 from core.risk_manager import RiskManager
 from core.signal import Direction
+from strategies.adx_trend import ADXTrendStrategy
 from strategies.breakout_momentum import BreakoutMomentumStrategy
 from strategies.ema_adx_volume import EMAAdxVolumeStrategy
 from strategies.ensemble import EnsembleStrategy
@@ -42,6 +43,7 @@ log = get_logger("Main")
 
 
 STRATEGY_MAP = {
+    "adx_trend": ADXTrendStrategy,
     "ensemble": EnsembleStrategy,
     "supertrend_rsi": SuperTrendRSIStrategy,
     "ema_adx_volume": EMAAdxVolumeStrategy,
@@ -800,7 +802,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--strategy",
-        default=os.getenv("ACTIVE_STRATEGY", "ensemble"),
+        default=os.getenv("ACTIVE_STRATEGY", "adx_trend"),
         choices=list(STRATEGY_MAP.keys()),
         help="Strategy to run",
     )
