@@ -163,12 +163,14 @@ class ADXTrendStrategy:
                 return self._reject("htf_misaligned")
 
             direction = Direction.LONG
-            confidence = 0.35
+            confidence = 0.42
 
             if curr_adx > 35:
-                confidence += 0.15
-            elif curr_adx > 30:
-                confidence += 0.10
+                confidence += 0.18
+            elif curr_adx > 28:
+                confidence += 0.12
+            elif curr_adx > 22:
+                confidence += 0.06
 
             if curr_vol > 1.5:
                 confidence += 0.10
@@ -187,12 +189,14 @@ class ADXTrendStrategy:
                 return self._reject("htf_misaligned")
 
             direction = Direction.SHORT
-            confidence = 0.35
+            confidence = 0.42
 
             if curr_adx > 35:
-                confidence += 0.15
-            elif curr_adx > 30:
-                confidence += 0.10
+                confidence += 0.18
+            elif curr_adx > 28:
+                confidence += 0.12
+            elif curr_adx > 22:
+                confidence += 0.06
 
             if curr_vol > 1.5:
                 confidence += 0.10

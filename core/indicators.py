@@ -23,7 +23,8 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
         (h - prev_c).abs(),
         (l - prev_c).abs(),
     ], axis=1).max(axis=1)
-    return tr.ewm(span=period, adjust=False).mean()
+    # Wilder smoothing: alpha = 1 / period.
+    return tr.ewm(com=period - 1, adjust=False).mean()
 
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -67,44 +68,68 @@ def supertrend(
     Returns (supertrend_line, direction)
     direction: +1 = bullish (price above), -1 = bearish
     """
-    _atr = atr(df, period)
-    hl2 = (df["high"] + df["low"]) / 2
+    if df.empty:
+        empty_float = pd.Series(index=df.index, dtype=float)
+        empty_int = pd.Series(index=df.index, dtype=int)
+        return empty_float, empty_int
 
-    upper_band = hl2 + multiplier * _atr
-    lower_band = hl2 - multiplier * _atr
+    _atr = atr(df, period).to_numpy(dtype=float)
+    high = df["high"].to_numpy(dtype=float)
+    low = df["low"].to_numpy(dtype=float)
+    close = df["close"].to_numpy(dtype=float)
 
-    supertrend = pd.Series(index=df.index, dtype=float)
-    direction = pd.Series(index=df.index, dtype=int)
+    hl2 = (high + low) / 2.0
+    basic_upper = hl2 + multiplier * _atr
+    basic_lower = hl2 - multiplier * _atr
 
-    for i in range(1, len(df)):
-        prev_ub = upper_band.iloc[i - 1]
-        prev_lb = lower_band.iloc[i - 1]
-        prev_close = df["close"].iloc[i - 1]
-        curr_close = df["close"].iloc[i]
+    n = len(df)
+    final_upper = np.full(n, np.nan, dtype=float)
+    final_lower = np.full(n, np.nan, dtype=float)
+    st_line = np.full(n, np.nan, dtype=float)
+    direction = np.full(n, 1, dtype=int)
 
-        upper_band.iloc[i] = (
-            upper_band.iloc[i]
-            if upper_band.iloc[i] < prev_ub or prev_close > prev_ub
-            else prev_ub
-        )
-        lower_band.iloc[i] = (
-            lower_band.iloc[i]
-            if lower_band.iloc[i] > prev_lb or prev_close < prev_lb
-            else prev_lb
-        )
+    final_upper[0] = basic_upper[0]
+    final_lower[0] = basic_lower[0]
+    st_line[0] = final_lower[0]
 
-        if i == 1:
-            direction.iloc[i] = 1
-        elif supertrend.iloc[i - 1] == prev_ub:
-            direction.iloc[i] = 1 if curr_close > upper_band.iloc[i] else -1
+    for i in range(1, n):
+        prev_ub = final_upper[i - 1]
+        prev_lb = final_lower[i - 1]
+        prev_close = close[i - 1]
+
+        curr_ub = basic_upper[i]
+        curr_lb = basic_lower[i]
+
+        if np.isnan(prev_ub):
+            final_upper[i] = curr_ub
+        elif np.isnan(curr_ub):
+            final_upper[i] = prev_ub
+        elif curr_ub < prev_ub or prev_close > prev_ub:
+            final_upper[i] = curr_ub
         else:
-            direction.iloc[i] = -1 if curr_close < lower_band.iloc[i] else 1
+            final_upper[i] = prev_ub
 
-        supertrend.iloc[i] = (
-            lower_band.iloc[i] if direction.iloc[i] == 1 else upper_band.iloc[i]
-        )
+        if np.isnan(prev_lb):
+            final_lower[i] = curr_lb
+        elif np.isnan(curr_lb):
+            final_lower[i] = prev_lb
+        elif curr_lb > prev_lb or prev_close < prev_lb:
+            final_lower[i] = curr_lb
+        else:
+            final_lower[i] = prev_lb
 
-    return supertrend, direction
+        prev_dir = direction[i - 1]
+        if prev_dir == 1:
+            direction[i] = -1 if close[i] < final_lower[i] else 1
+        else:
+            direction[i] = 1 if close[i] > final_upper[i] else -1
+
+        st_line[i] = final_lower[i] if direction[i] == 1 else final_upper[i]
+
+    return (
+        pd.Series(st_line, index=df.index, dtype=float),
+        pd.Series(direction, index=df.index, dtype=int),
+    )
 
 
 def adx(df: pd.DataFrame, period: int = 14) -> tuple[pd.Series, pd.Series, pd.Series]:
@@ -126,14 +151,15 @@ def adx(df: pd.DataFrame, period: int = 14) -> tuple[pd.Series, pd.Series, pd.Se
     neg_dm = pd.Series(neg_dm, index=df.index)
 
     _atr = atr(df, period)
-    smooth_pos = pos_dm.ewm(span=period, adjust=False).mean()
-    smooth_neg = neg_dm.ewm(span=period, adjust=False).mean()
+    # Wilder smoothing for directional movement.
+    smooth_pos = pos_dm.ewm(com=period - 1, adjust=False).mean()
+    smooth_neg = neg_dm.ewm(com=period - 1, adjust=False).mean()
 
     di_pos = 100 * smooth_pos / _atr.replace(0, np.nan)
     di_neg = 100 * smooth_neg / _atr.replace(0, np.nan)
 
     dx = 100 * (di_pos - di_neg).abs() / (di_pos + di_neg).replace(0, np.nan)
-    adx_line = dx.ewm(span=period, adjust=False).mean()
+    adx_line = dx.ewm(com=period - 1, adjust=False).mean()
 
     return adx_line, di_pos, di_neg
 

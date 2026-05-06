@@ -15,6 +15,7 @@ from core.signal import Signal, Direction
 from strategies.supertrend_rsi import SuperTrendRSIStrategy
 from strategies.ema_adx_volume import EMAAdxVolumeStrategy
 from strategies.breakout_momentum import BreakoutMomentumStrategy
+from strategies.mean_reversion import MeanReversionStrategy
 from config import CONFIG
 from utils.logger import get_logger
 
@@ -22,9 +23,10 @@ log = get_logger("Ensemble")
 
 # Weights per strategy (must sum to 1.0)
 WEIGHTS = {
-    SuperTrendRSIStrategy.name:     0.45,
-    EMAAdxVolumeStrategy.name:      0.35,
+    SuperTrendRSIStrategy.name:     0.30,
+    EMAAdxVolumeStrategy.name:      0.30,
     BreakoutMomentumStrategy.name:  0.20,
+    MeanReversionStrategy.name:     0.20,
 }
 
 REGIME_ALLOWLIST = {
@@ -33,7 +35,7 @@ REGIME_ALLOWLIST = {
         EMAAdxVolumeStrategy.name,
     },
     MarketRegime.RANGING: {
-        SuperTrendRSIStrategy.name,
+        MeanReversionStrategy.name,
         BreakoutMomentumStrategy.name,
     },
     MarketRegime.HIGH_VOL: {
@@ -52,8 +54,13 @@ class EnsembleStrategy:
             SuperTrendRSIStrategy(),
             EMAAdxVolumeStrategy(),
             BreakoutMomentumStrategy(),
+            MeanReversionStrategy(),
         ]
         self.last_skip_reason: str = ""
+
+    @staticmethod
+    def _min_agree(runnable_count: int) -> int:
+        return max(1, int(runnable_count) - 1)
 
     def generate(
         self,
@@ -93,7 +100,7 @@ class EnsembleStrategy:
         long_sigs  = [s for s in signals if s.direction == Direction.LONG]
         short_sigs = [s for s in signals if s.direction == Direction.SHORT]
 
-        min_agree = min(CONFIG.strategy.ensemble_min_signals, len(runnable))
+        min_agree = self._min_agree(len(runnable))
         winning_sigs = None
         direction = Direction.FLAT
 

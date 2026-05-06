@@ -86,65 +86,95 @@ class EMAAdxVolumeStrategy:
         if np.isnan(adx_val):
             return None
 
-        # Trend must be strong
-        trending = adx_val > cfg.adx_threshold
+        prev_adx = adx_line.iloc[signal_idx - 1]
+        adx_rising = not np.isnan(prev_adx) and adx_val > prev_adx
+        trending_strong = adx_val >= cfg.adx_threshold
+        trending_building = adx_val >= (cfg.adx_threshold * 0.80) and adx_rising
 
         # --- LONG conditions ---
         ema_bull = e_f > e_s > e_t                  # stacked bullish
         di_bull  = dip > din                         # directional bias
         vol_spike = vol >= cfg.volume_spike_ratio    # volume confirmation
-        # Pullback to slow EMA (entry near value, not chase)
-        pullback_bull = abs(curr - e_s) / curr < 0.012  # within 1.2% of slow EMA
-        rsi_bull = 40 < curr_rsi < 70               # not overbought
+        # Wider pullback tolerance avoids over-filtering during strong trends.
+        pullback_pct = abs(curr - e_s) / curr
+        pullback_bull = pullback_pct <= 0.025
+        pullback_bull_loose = pullback_pct <= 0.040
+        rsi_bull = 40 <= curr_rsi <= 68             # not overbought
 
         # --- SHORT conditions ---
         ema_bear = e_f < e_s < e_t
         di_bear  = din > dip
-        pullback_bear = abs(curr - e_s) / curr < 0.012
-        rsi_bear = 30 < curr_rsi < 60
+        pullback_bear = pullback_pct <= 0.025
+        pullback_bear_loose = pullback_pct <= 0.040
+        rsi_bear = 32 <= curr_rsi <= 60
 
         # ---- Determine direction ----
         direction = Direction.FLAT
         confidence = 0.0
+        trend_state = "none"
+        htf_b = self._htf_score(htf_df, htf_df2)
 
-        if trending and ema_bull and di_bull:
+        if ema_bull and di_bull:
+            if trending_strong:
+                trend_state = "strong"
+            elif trending_building:
+                trend_state = "emerging"
+            else:
+                return None
+
             direction = Direction.LONG
-            confidence += 0.30   # EMA stack
-            confidence += 0.20   # ADX
+            confidence += 0.34   # base conviction for EMA+DI alignment
+            confidence += 0.18 if trend_state == "strong" else 0.10
             if vol_spike:
-                confidence += 0.20
+                confidence += 0.14
+            elif vol >= 1.0:
+                confidence += 0.06
             if pullback_bull:
-                confidence += 0.15
+                confidence += 0.12
+            elif pullback_bull_loose:
+                confidence += 0.05
             if rsi_bull:
-                confidence += 0.10
-            # HTF bonus
-            htf_b = self._htf_score(htf_df, htf_df2)
+                confidence += 0.08
             if htf_b > 0:
                 confidence += 0.10
+            elif htf_b == 0:
+                confidence += 0.03
             if pivots:
                 if curr >= pivots["PP"]:
-                    confidence += 0.05
+                    confidence += 0.04
                 if curr >= pivots["R1"]:
-                    confidence += 0.03
+                    confidence += 0.02
 
-        elif trending and ema_bear and di_bear:
+        elif ema_bear and di_bear:
+            if trending_strong:
+                trend_state = "strong"
+            elif trending_building:
+                trend_state = "emerging"
+            else:
+                return None
+
             direction = Direction.SHORT
-            confidence += 0.30
-            confidence += 0.20
+            confidence += 0.34
+            confidence += 0.18 if trend_state == "strong" else 0.10
             if vol_spike:
-                confidence += 0.20
+                confidence += 0.14
+            elif vol >= 1.0:
+                confidence += 0.06
             if pullback_bear:
-                confidence += 0.15
+                confidence += 0.12
+            elif pullback_bear_loose:
+                confidence += 0.05
             if rsi_bear:
-                confidence += 0.10
-            htf_b = self._htf_score(htf_df, htf_df2)
+                confidence += 0.08
             if htf_b < 0:
                 confidence += 0.10
+            elif htf_b == 0:
+                confidence += 0.03
             if pivots:
                 if curr <= pivots["PP"]:
-                    confidence += 0.05
+                    confidence += 0.04
                 if curr <= pivots["S1"]:
-                    confidence += 0.03
+                    confidence += 0.02
 
         if direction == Direction.FLAT:
             return None
@@ -166,8 +196,9 @@ class EMAAdxVolumeStrategy:
             tp2 = curr - tp2_dist
 
         reason = (
-            f"EMA {'↑' if ema_bull else '↓'} | ADX={adx_val:.1f} | "
+            f"EMA {'↑' if ema_bull else '↓'} | ADX={adx_val:.1f} ({trend_state}) | "
             f"DI+={dip:.1f} DI-={din:.1f} | Vol={vol:.1f}x | RSI={curr_rsi:.1f} | "
+            f"pullback={pullback_pct*100:.2f}% | "
             f"SR={'on' if pivots else 'off'} | closed_bar=true"
         )
 

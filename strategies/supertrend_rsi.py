@@ -80,6 +80,7 @@ class SuperTrendRSIStrategy:
 
         # --- Signal conditions ---
         direction = Direction.FLAT
+        entry_mode = ""
 
         # RSI confirmation
         rsi_bull = prev_rsi < cfg.rsi_oversold and curr_rsi >= cfg.rsi_oversold
@@ -91,22 +92,39 @@ class SuperTrendRSIStrategy:
         htf_bull = htf_bias == Direction.LONG
         htf_bear = htf_bias == Direction.SHORT
 
+        long_flip = curr_dir == 1 and prev_dir == -1 and (rsi_bull or rsi_mid_bull)
+        short_flip = curr_dir == -1 and prev_dir == 1 and (rsi_bear or rsi_mid_bear)
+        long_cont = curr_dir == 1 and prev_dir == 1 and htf_bull and rsi_mid_bull
+        short_cont = curr_dir == -1 and prev_dir == -1 and htf_bear and rsi_mid_bear
+
         # ----- LONG -----
-        if curr_dir == 1 and (rsi_bull or (rsi_mid_bull and prev_dir == -1)):
+        if long_flip or long_cont:
             direction = Direction.LONG
             confidence = 0.0
-            if curr_dir == 1 and prev_dir == -1:
-                confidence += 0.35   # fresh flip
+            if long_flip:
+                confidence += 0.32   # fresh flip
+                entry_mode = "flip"
             else:
-                confidence += 0.20
+                confidence += 0.22   # continuation with HTF confluence
+                entry_mode = "continuation"
+
             if rsi_bull:
-                confidence += 0.25
-            elif rsi_mid_bull:
+                confidence += 0.18
+            elif curr_rsi <= 50:
+                confidence += 0.12
+            elif curr_rsi <= 60:
                 confidence += 0.10
+            else:
+                confidence += 0.05
+
             if htf_bull:
-                confidence += 0.25
+                confidence += 0.20
             elif htf_bias == Direction.FLAT:
-                confidence += 0.10
+                confidence += 0.06
+
+            if long_cont:
+                confidence += 0.06
+
             # Taker buy ratio
             if "taker_ratio" in df.columns and df["taker_ratio"].iloc[signal_idx] > 0.55:
                 confidence += 0.10
@@ -118,21 +136,33 @@ class SuperTrendRSIStrategy:
             confidence = min(confidence, 1.0)
 
         # ----- SHORT -----
-        elif curr_dir == -1 and (rsi_bear or (rsi_mid_bear and prev_dir == 1)):
+        elif short_flip or short_cont:
             direction = Direction.SHORT
             confidence = 0.0
-            if curr_dir == -1 and prev_dir == 1:
-                confidence += 0.35
+            if short_flip:
+                confidence += 0.32
+                entry_mode = "flip"
             else:
-                confidence += 0.20
+                confidence += 0.22
+                entry_mode = "continuation"
+
             if rsi_bear:
-                confidence += 0.25
-            elif rsi_mid_bear:
+                confidence += 0.18
+            elif curr_rsi >= 50:
+                confidence += 0.12
+            elif curr_rsi >= 40:
                 confidence += 0.10
+            else:
+                confidence += 0.05
+
             if htf_bear:
-                confidence += 0.25
+                confidence += 0.20
             elif htf_bias == Direction.FLAT:
-                confidence += 0.10
+                confidence += 0.06
+
+            if short_cont:
+                confidence += 0.06
+
             if "taker_ratio" in df.columns and df["taker_ratio"].iloc[signal_idx] < 0.45:
                 confidence += 0.10
             if pivots:
@@ -161,6 +191,7 @@ class SuperTrendRSIStrategy:
 
         reason = (
             f"ST={'↑' if curr_dir==1 else '↓'} flip={'yes' if curr_dir!=prev_dir else 'no'} | "
+            f"mode={entry_mode or 'n/a'} | "
             f"RSI={curr_rsi:.1f} | HTF={htf_bias.value} | "
             f"SR={'on' if pivots else 'off'} | closed_bar=true"
         )

@@ -35,6 +35,7 @@ from strategies.adx_trend import ADXTrendStrategy
 from strategies.breakout_momentum import BreakoutMomentumStrategy
 from strategies.ema_adx_volume import EMAAdxVolumeStrategy
 from strategies.ensemble import EnsembleStrategy
+from strategies.mean_reversion import MeanReversionStrategy
 from strategies.supertrend_rsi import SuperTrendRSIStrategy
 from utils.logger import get_logger
 from utils.notifier import notify_event, notify_signal, notify_stats, notify_trade_open
@@ -48,6 +49,7 @@ STRATEGY_MAP = {
     "supertrend_rsi": SuperTrendRSIStrategy,
     "ema_adx_volume": EMAAdxVolumeStrategy,
     "breakout_momentum": BreakoutMomentumStrategy,
+    "mean_reversion": MeanReversionStrategy,
 }
 
 

@@ -3,7 +3,7 @@ backtest.py — Offline backtester using mainnet historical data.
 Run this BEFORE going live to validate the strategy on your chosen symbols.
 
 Usage:
-    python backtest.py --symbol BTCUSDT --tf 4h --days 180 --strategy adx_trend
+    python backtest.py --symbol BTCUSDT --tf 1h --days 180 --strategy adx_trend
 """
 from __future__ import annotations
 import sys
@@ -22,6 +22,7 @@ from strategies.ensemble import EnsembleStrategy
 from strategies.supertrend_rsi import SuperTrendRSIStrategy
 from strategies.ema_adx_volume import EMAAdxVolumeStrategy
 from strategies.breakout_momentum import BreakoutMomentumStrategy
+from strategies.mean_reversion import MeanReversionStrategy
 from utils.logger import get_logger
 
 log = get_logger("Backtest")
@@ -32,6 +33,7 @@ STRATEGY_MAP = {
     "supertrend_rsi":    SuperTrendRSIStrategy,
     "ema_adx_volume":    EMAAdxVolumeStrategy,
     "breakout_momentum": BreakoutMomentumStrategy,
+    "mean_reversion":    MeanReversionStrategy,
 }
 
 INTERVAL_MINUTES = {
@@ -662,7 +664,7 @@ class Backtest:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AlphaBot Backtester")
     parser.add_argument("--symbol",   default="BTCUSDT")
-    parser.add_argument("--tf",       default="4h")
+    parser.add_argument("--tf",       default=CONFIG.strategy.primary_tf)
     parser.add_argument("--days",     type=int, default=60)
     parser.add_argument("--strategy", default="adx_trend",
                         choices=list(STRATEGY_MAP.keys()))
